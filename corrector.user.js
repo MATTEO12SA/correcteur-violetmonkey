@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.0.0
+// @version        4.1.0
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -380,46 +380,84 @@
     },
 
     // ─────────────────────────────────────────────
-    // Remplacement du texte — FIX saut de ligne
+    // Remplacement du texte
+    // 3 stratégies selon le type d'élément cible
     // ─────────────────────────────────────────────
     applyCorrection(corrected) {
-      if (!this.selectedRange) { this.closeMenu(); return; }
+      if (!this.selectedRange) { this.showApplyError('Sélection perdue. Resélectionnez le texte.'); return; }
 
       try {
-        // 1. Rétablir la sélection à partir du range mémorisé
-        const sel = window.getSelection();
-        if (sel) {
-          sel.removeAllRanges();
-          sel.addRange(this.selectedRange);
-        }
+        const anchor = this.selectedRange.commonAncestorContainer;
+        const parent = anchor.nodeType === Node.TEXT_NODE ? anchor.parentElement : anchor;
+        const sel    = window.getSelection();
 
-        // 2. Essayer execCommand (meilleure compatibilité contenteditable)
-        if (document.execCommand && document.execCommand('insertText', false, corrected)) {
+        // ── Cas 1 : <input> ou <textarea> ──────────
+        const inputEl = parent && parent.closest('input, textarea');
+        if (inputEl && typeof inputEl.selectionStart === 'number') {
+          inputEl.focus();
+          const start = inputEl.selectionStart;
+          const end   = inputEl.selectionEnd;
+          inputEl.setRangeText(corrected, start, end, 'end');
+          inputEl.dispatchEvent(new Event('input',  { bubbles: true }));
+          inputEl.dispatchEvent(new Event('change', { bubbles: true }));
           this.closeMenu();
           this.showConfirmation();
           return;
         }
 
-        // 3. Fallback : manipulation de Range
+        // ── Cas 2 : contenteditable ─────────────────
+        const editableEl = parent && parent.closest('[contenteditable="true"], [contenteditable=""]');
+        if (editableEl) {
+          if (sel) { sel.removeAllRanges(); sel.addRange(this.selectedRange); }
+          // execCommand ici UNIQUEMENT car on est dans un contenteditable
+          if (document.execCommand('insertText', false, corrected)) {
+            this.closeMenu();
+            this.showConfirmation();
+            return;
+          }
+          // Fallback contenteditable si execCommand échoue
+          this.selectedRange.deleteContents();
+          const tn = document.createTextNode(corrected);
+          this.selectedRange.insertNode(tn);
+          const nr = document.createRange();
+          nr.setStartAfter(tn); nr.collapse(true);
+          if (sel) { sel.removeAllRanges(); sel.addRange(nr); }
+          this.closeMenu();
+          this.showConfirmation();
+          return;
+        }
+
+        // ── Cas 3 : DOM statique (span, p, div…) ───
         this.selectedRange.deleteContents();
         const textNode = document.createTextNode(corrected);
         this.selectedRange.insertNode(textNode);
 
-        // Placer le curseur APRES le texte inséré (évite les sauts de ligne)
+        // Curseur après le texte inséré → évite les sauts de ligne
         const newRange = document.createRange();
         newRange.setStartAfter(textNode);
         newRange.collapse(true);
-        if (sel) {
-          sel.removeAllRanges();
-          sel.addRange(newRange);
-        }
+        if (sel) { sel.removeAllRanges(); sel.addRange(newRange); }
 
         this.closeMenu();
         this.showConfirmation();
+
       } catch (err) {
         console.error('[Correcteur]', err);
-        this.closeMenu();
+        this.showApplyError('Impossible de remplacer sur ce site. Utilisez "Copier".');
       }
+    },
+
+    // Affiche une erreur inline dans le panneau (sans le fermer)
+    showApplyError(msg) {
+      if (!this.menu) return;
+      let errEl = this.menu.querySelector('.corrector-apply-error');
+      if (!errEl) {
+        errEl = document.createElement('div');
+        errEl.className = 'corrector-apply-error';
+        const actions = this.menu.querySelector('.corrector-actions');
+        actions.parentNode.insertBefore(errEl, actions);
+      }
+      errEl.textContent = '\u26A0\uFE0F ' + msg;
     },
 
     showConfirmation() {
@@ -657,6 +695,18 @@
           .corrector-cancel-btn         { background:#27272a; border-color:#3f3f46; color:#d4d4d8; }
           .corrector-cancel-btn:hover   { background:#3f3f46; }
           .corrector-actions            { border-color:#3f3f46; }
+        }
+
+        /* Erreur inline appliquer */
+        .corrector-apply-error {
+          margin: 0 14px 8px;
+          padding: 7px 10px;
+          background: #fef2f2;
+          border: 1px solid #fecaca;
+          border-radius: 6px;
+          font-size: 12px;
+          color: #b91c1c;
+          line-height: 1.4;
         }
 
         /* Toast */
