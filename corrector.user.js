@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.1.0
+// @version        4.1.1
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -34,6 +34,7 @@
       document.addEventListener('selectionchange', ()  => this.handleSelectionChange());
       document.addEventListener('click',           (e) => this.handleOutsideClick(e));
       document.addEventListener('keydown',         (e) => this.handleKeyDown(e));
+      window.addEventListener('beforeunload',      ()  => this.closeMenu());
       this.injectStyles();
       this.watchNavigation();
     },
@@ -339,6 +340,12 @@
         this.savePosition(parseInt(menu.style.left), parseInt(menu.style.top));
       };
 
+      // Expose pour nettoyage si le menu est fermé en cours de drag
+      menu._dragCleanup = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup',   onUp);
+      };
+
       header.addEventListener('mousedown', (e) => {
         if (e.target.closest('.corrector-close-btn')) return;
         e.preventDefault();
@@ -411,7 +418,15 @@
           if (sel) { sel.removeAllRanges(); sel.addRange(this.selectedRange); }
           // execCommand ici UNIQUEMENT car on est dans un contenteditable
           if (document.execCommand('insertText', false, corrected)) {
+            // Sauvegarder le curseur AVANT closeMenu() : la suppression du bouton focusé
+            // déplace le focus sur <body> et efface la sélection du contenteditable.
+            const afterRange = sel && sel.rangeCount > 0 ? sel.getRangeAt(0).cloneRange() : null;
             this.closeMenu();
+            editableEl.focus();
+            if (afterRange) {
+              const s = window.getSelection();
+              if (s) { s.removeAllRanges(); s.addRange(afterRange); }
+            }
             this.showConfirmation();
             return;
           }
@@ -421,8 +436,10 @@
           this.selectedRange.insertNode(tn);
           const nr = document.createRange();
           nr.setStartAfter(tn); nr.collapse(true);
-          if (sel) { sel.removeAllRanges(); sel.addRange(nr); }
           this.closeMenu();
+          editableEl.focus();
+          const s = window.getSelection();
+          if (s) { s.removeAllRanges(); s.addRange(nr); }
           this.showConfirmation();
           return;
         }
@@ -487,10 +504,12 @@
     closeMenu() {
       if (this.currentRequest) { this.currentRequest.abort(); this.currentRequest = null; }
       if (this.menu) {
+        if (typeof this.menu._dragCleanup === 'function') this.menu._dragCleanup();
         this.menu.remove();
         this.menu = null;
         if (this.previousFocus && typeof this.previousFocus.focus === 'function') this.previousFocus.focus();
-        this.previousFocus = null;
+        this.previousFocus  = null;
+        this.selectedRange  = null;
       }
     },
 
