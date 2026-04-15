@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.4.1
+// @version        4.5.0
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -18,20 +18,37 @@
 
   const STORAGE_KEY = '__corrector_v4_pos';
   const DEBUG_STORAGE_KEY = '__corrector_debug';
+  const CONFIRMATION_STORAGE_KEY = '__corrector_confirmation';
   const NAV_EVENT = '_corrector_nav';
   const HISTORY_PATCH_FLAG = '__corrector_history_patched';
   const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url', 'tel', 'email', 'password']);
-  const DEBUG = (() => {
+
+  const readStoredFlag = (key) => {
+    try {
+      return localStorage.getItem(key) === '1';
+    } catch (_) {
+      return false;
+    }
+  };
+
+  const writeStoredFlag = (key, enabled) => {
+    try {
+      if (enabled) localStorage.setItem(key, '1');
+      else localStorage.removeItem(key);
+    } catch (_) {}
+  };
+
+  const URL_DEBUG_ENABLED = (() => {
     try {
       const params = new URLSearchParams(window.location.search);
-      if (params.get('correctorDebug') === '1') return true;
-    } catch (_) {}
-    try {
-      return localStorage.getItem(DEBUG_STORAGE_KEY) === '1';
+      return params.get('correctorDebug') === '1';
     } catch (_) {
       return false;
     }
   })();
+
+  let debugEnabled = URL_DEBUG_ENABLED || readStoredFlag(DEBUG_STORAGE_KEY);
+  let confirmationEnabled = readStoredFlag(CONFIRMATION_STORAGE_KEY);
   const _logs = [];
 
   const isTextControl = (el) => {
@@ -56,14 +73,14 @@
   };
 
   const dbg = (...a) => {
-    if (!DEBUG) return;
+    if (!debugEnabled) return;
     const line = a.map(x => (typeof x === 'object' ? JSON.stringify(x) : String(x))).join(' ');
     _logs.push(new Date().toISOString().slice(11, 23) + ' ' + line);
   };
 
   // Snapshot complet de l'état du DOM + sélection à un instant T
   const snap = (label, el) => {
-    if (!DEBUG) return;
+    if (!debugEnabled) return;
     const sel = window.getSelection();
     const ae  = document.activeElement;
     const info = {
@@ -80,7 +97,7 @@
 
   // Surveille les mutations DOM sur un élément pendant N ms
   const watchMutations = (el, ms) => {
-    if (!DEBUG) return;
+    if (!debugEnabled) return;
     const obs = new MutationObserver((muts) => {
       for (const m of muts) {
         dbg('MUTATION type=' + m.type +
@@ -95,7 +112,7 @@
 
   // Surveille les events clavier + input sur un élément pendant N ms
   const watchKeys = (el, ms) => {
-    if (!DEBUG) return;
+    if (!debugEnabled) return;
     const onKd = (e) => dbg('KEYDOWN key=' + JSON.stringify(e.key) +
       ' code=' + e.code +
       ' defaultPrevented=' + e.defaultPrevented +
@@ -122,12 +139,19 @@
   };
 
   const downloadLogs = () => {
-    if (!_logs.length) return;
-    const blob = new Blob([_logs.join('\n')], { type: 'text/plain' });
+    const content = _logs.length ? _logs.join('\n') : 'Aucun log capturé pour le moment.';
+    const blob = new Blob([content], { type: 'text/plain' });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement('a');
-    a.href = url; a.download = 'correcteur-debug.txt'; a.click();
-    URL.revokeObjectURL(url);
+    a.href = url;
+    a.download = 'correcteur-debug.txt';
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      a.remove();
+      URL.revokeObjectURL(url);
+    }, 0);
   };
 
   const TextCorrector = {
@@ -147,6 +171,54 @@
     _styleObserver: null,
     _pillSelectionContext: null,
     correctionCache: new Map(),
+
+    setDebugEnabled(enabled) {
+      debugEnabled = !!enabled;
+      writeStoredFlag(DEBUG_STORAGE_KEY, debugEnabled);
+      if (!debugEnabled) {
+        _logs.length = 0;
+      } else {
+        dbg('debug enabled');
+      }
+      this.syncSettingsPanel();
+    },
+
+    setConfirmationEnabled(enabled) {
+      confirmationEnabled = !!enabled;
+      writeStoredFlag(CONFIRMATION_STORAGE_KEY, confirmationEnabled);
+      this.syncSettingsPanel();
+    },
+
+    toggleSettingsPanel(force) {
+      if (!this.menu) return;
+      const panel = this.menu.querySelector('.corrector-settings-panel');
+      const btn = this.menu.querySelector('.corrector-settings-btn');
+      if (!panel || !btn) return;
+      const shouldOpen = typeof force === 'boolean' ? force : panel.hidden;
+      panel.hidden = !shouldOpen;
+      btn.setAttribute('aria-expanded', shouldOpen ? 'true' : 'false');
+      this.syncSettingsPanel();
+    },
+
+    syncSettingsPanel() {
+      if (!this.menu) return;
+      const panel = this.menu.querySelector('.corrector-settings-panel');
+      if (!panel) return;
+
+      const debugInput = panel.querySelector('.corrector-setting-debug');
+      const confirmInput = panel.querySelector('.corrector-setting-confirmation');
+      const downloadBtn = panel.querySelector('.corrector-download-logs-btn');
+      const status = panel.querySelector('.corrector-settings-status');
+
+      if (debugInput) debugInput.checked = debugEnabled;
+      if (confirmInput) confirmInput.checked = confirmationEnabled;
+      if (downloadBtn) downloadBtn.disabled = !debugEnabled;
+      if (status) {
+        status.textContent = debugEnabled
+          ? (_logs.length ? 'Logs actifs. Clique sur "Télécharger les logs" après avoir reproduit le bug.' : 'Logs actifs. Reproduis le bug puis télécharge le fichier.')
+          : 'Logs désactivés. Active-les ici si tu veux un fichier de debug.';
+      }
+    },
 
     getDomSelectionContext() {
       const sel = window.getSelection();
@@ -564,7 +636,22 @@
       menu.innerHTML = [
         '<div class="corrector-header" title="Maintenir pour déplacer">',
         '  <span class="corrector-title" id="corrector-title">\u270E Correcteur</span>',
-        '  <button class="corrector-close-btn" aria-label="Fermer">\u2715</button>',
+        '  <div class="corrector-header-actions">',
+        '    <button class="corrector-settings-btn" aria-label="Paramètres" aria-expanded="false" title="Paramètres">\u2699</button>',
+        '    <button class="corrector-close-btn" aria-label="Fermer">\u2715</button>',
+        '  </div>',
+        '</div>',
+        '<div class="corrector-settings-panel" hidden>',
+        '  <label class="corrector-setting-row">',
+        '    <input type="checkbox" class="corrector-setting-debug">',
+        '    <span>Activer les logs de debug</span>',
+        '  </label>',
+        '  <button class="corrector-download-logs-btn" type="button">Télécharger les logs</button>',
+        '  <div class="corrector-settings-status"></div>',
+        '  <label class="corrector-setting-row">',
+        '    <input type="checkbox" class="corrector-setting-confirmation">',
+        '    <span>Afficher la notification après remplacement</span>',
+        '  </label>',
         '</div>',
         '<div class="corrector-section">',
         '  <div class="corrector-label">Texte sélectionné</div>',
@@ -579,7 +666,6 @@
         '</div>',
         '<div class="corrector-actions">',
         '  <button class="corrector-apply-btn" disabled>Appliquer</button>',
-        DEBUG ? '  <button class="corrector-debug-btn">Logs</button>' : '',
         '  <button class="corrector-copy-btn" style="display:none">Copier</button>',
         '  <button class="corrector-cancel-btn">Fermer</button>',
         '</div>',
@@ -616,12 +702,23 @@
       const close = () => this.closeMenu();
       menu.querySelector('.corrector-cancel-btn').addEventListener('click', close);
       menu.querySelector('.corrector-close-btn').addEventListener('click',  close);
-      if (DEBUG) menu.querySelector('.corrector-debug-btn')?.addEventListener('click', () => downloadLogs());
+      menu.querySelector('.corrector-settings-btn').addEventListener('click', (e) => {
+        e.preventDefault();
+        this.toggleSettingsPanel();
+      });
+      menu.querySelector('.corrector-setting-debug').addEventListener('change', (e) => {
+        this.setDebugEnabled(e.currentTarget.checked);
+      });
+      menu.querySelector('.corrector-setting-confirmation').addEventListener('change', (e) => {
+        this.setConfirmationEnabled(e.currentTarget.checked);
+      });
+      menu.querySelector('.corrector-download-logs-btn').addEventListener('click', () => downloadLogs());
       menu.addEventListener('keydown', (e) => this.handleMenuKeyDown(e));
 
       document.body.appendChild(menu);
       this.menu = menu;
       this.resetActionState();
+      this.syncSettingsPanel();
 
       // Drag
       this.makeDraggable(menu);
@@ -662,7 +759,7 @@
       };
 
       header.addEventListener('mousedown', (e) => {
-        if (e.target.closest('.corrector-close-btn')) return;
+        if (e.target.closest('.corrector-close-btn') || e.target.closest('.corrector-settings-btn')) return;
         e.preventDefault();
         startX    = e.clientX;
         startY    = e.clientY;
@@ -751,7 +848,7 @@
             this.showApplyError('Le texte a changé depuis la sélection. Resélectionnez.');
             return;
           }
-          if (DEBUG) {
+          if (debugEnabled) {
             watchMutations(editableEl, 8000);
             watchKeys(editableEl, 8000);
           }
@@ -1051,6 +1148,7 @@
     },
 
     showConfirmation(withUndo) {
+      if (!confirmationEnabled) return;
       const toast = document.createElement('div');
       toast.className = 'corrector-toast';
       toast.setAttribute('role', 'status');
@@ -1195,6 +1293,11 @@
           align-items: center;
           gap: 6px;
         }
+        .corrector-header-actions {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+        }
         .corrector-badge {
           font-size: 11px;
           background: #ef4444;
@@ -1203,13 +1306,57 @@
           padding: 1px 7px;
           font-weight: 600;
         }
+        .corrector-settings-btn,
         .corrector-close-btn {
           background: none; border: none; cursor: pointer;
           font-size: 15px; color: #9ca3af; border-radius: 6px;
           padding: 2px 6px; line-height: 1;
           transition: background .15s, color .15s;
         }
+        .corrector-settings-btn:hover,
         .corrector-close-btn:hover { background: #f3f4f6; color: #374151; }
+
+        .corrector-settings-panel {
+          padding: 10px 14px 12px;
+          background: #fff7ed;
+          border-bottom: 1px solid #fed7aa;
+          display: grid;
+          gap: 10px;
+        }
+        .corrector-settings-panel[hidden] { display: none; }
+        .corrector-setting-row {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 12px;
+          color: #7c2d12;
+        }
+        .corrector-setting-row input { margin: 0; }
+        .corrector-settings-status {
+          font-size: 11px;
+          line-height: 1.4;
+          color: #9a3412;
+        }
+        .corrector-download-logs-btn {
+          cursor: pointer;
+          padding: 6px 10px;
+          border: 1px solid #f59e0b;
+          background: #fff;
+          color: #b45309;
+          border-radius: 6px;
+          font-size: 12px;
+          font-weight: 600;
+          justify-self: start;
+          transition: background .15s, color .15s, border-color .15s;
+        }
+        .corrector-download-logs-btn:hover:not(:disabled) {
+          background: #f59e0b;
+          color: #fff;
+        }
+        .corrector-download-logs-btn:disabled {
+          cursor: default;
+          opacity: .55;
+        }
 
         .corrector-section { padding: 10px 14px 0; }
         .corrector-label {
@@ -1302,14 +1449,6 @@
         }
         .corrector-copy-btn:hover { background: #16a34a; color: #fff; }
 
-        .corrector-debug-btn {
-          cursor: pointer; padding: 6px 14px;
-          border: 1.5px solid #f59e0b; background: transparent;
-          color: #b45309; border-radius: 6px; font-size: 13px;
-          transition: background .15s, color .15s;
-        }
-        .corrector-debug-btn:hover { background: #f59e0b; color: #fff; }
-
         .corrector-cancel-btn {
           cursor: pointer; padding: 6px 14px;
           border: 1.5px solid #e5e7eb; background: #f9fafb;
@@ -1323,13 +1462,18 @@
           .text-corrector-menu          { background:#18181b; border-color:#3f3f46; color:#f4f4f5; }
           .corrector-header             { background:#27272a; border-color:#3f3f46; }
           .corrector-title              { color:#60a5fa; }
+          .corrector-settings-btn,
           .corrector-close-btn          { color:#71717a; }
+          .corrector-settings-btn:hover,
           .corrector-close-btn:hover    { background:#3f3f46; color:#f4f4f5; }
+          .corrector-settings-panel     { background:#2b2116; border-color:#713f12; }
+          .corrector-setting-row        { color:#fdba74; }
+          .corrector-settings-status    { color:#fb923c; }
+          .corrector-download-logs-btn  { background:#18181b; border-color:#f59e0b; color:#fbbf24; }
+          .corrector-download-logs-btn:hover:not(:disabled) { background:#f59e0b; color:#18181b; }
           .corrector-label              { color:#71717a; }
           .corrector-original-content   { background:#27272a; border-color:#3f3f46; color:#a1a1aa; }
           .corrector-correction-content { background:#1e3a5f; border-color:#1d4ed8; color:#93c5fd; }
-          .corrector-debug-btn          { border-color:#f59e0b; color:#fbbf24; }
-          .corrector-debug-btn:hover    { background:#f59e0b; color:#18181b; }
           .corrector-cancel-btn         { background:#27272a; border-color:#3f3f46; color:#d4d4d8; }
           .corrector-cancel-btn:hover   { background:#3f3f46; }
           .corrector-actions            { border-color:#3f3f46; }

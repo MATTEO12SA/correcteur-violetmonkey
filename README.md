@@ -60,14 +60,17 @@ Pour forcer une mise à jour manuelle :
 - Compatible avec les SPA (Facebook, Instagram, Twitter…)
 - Dark mode automatique
 - Navigation clavier complète (accessibilité)
+- Paramètres rapides via l'engrenage du panneau
 - Fonctionne sur tous les sites (`*://*/*`)
 
 ## Debug local
 
 Le mode debug est désactivé par défaut.
 
+- Méthode recommandée : ouvre le panneau du correcteur puis clique sur l'engrenage pour activer les logs
+- Les logs se téléchargent manuellement via le bouton `Télécharger les logs` dans ce même panneau
 - Activer temporairement sur une page : ajoute `?correctorDebug=1` à l'URL
-- Activer de façon persistante :
+- Activer de façon persistante via la console :
 
 ```js
 localStorage.setItem('__corrector_debug', '1');
