@@ -62,6 +62,23 @@ Pour forcer une mise à jour manuelle :
 - Navigation clavier complète (accessibilité)
 - Fonctionne sur tous les sites (`*://*/*`)
 
+## Debug local
+
+Le mode debug est désactivé par défaut.
+
+- Activer temporairement sur une page : ajoute `?correctorDebug=1` à l'URL
+- Activer de façon persistante :
+
+```js
+localStorage.setItem('__corrector_debug', '1');
+```
+
+- Désactiver :
+
+```js
+localStorage.removeItem('__corrector_debug');
+```
+
 ---
 
 ## Technologies

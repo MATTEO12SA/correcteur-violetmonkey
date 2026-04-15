@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.3.1
+// @version        4.4.0
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -17,8 +17,43 @@
   'use strict';
 
   const STORAGE_KEY = '__corrector_v4_pos';
-  const DEBUG = true;
+  const DEBUG_STORAGE_KEY = '__corrector_debug';
+  const NAV_EVENT = '_corrector_nav';
+  const HISTORY_PATCH_FLAG = '__corrector_history_patched';
+  const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url', 'tel', 'email', 'password']);
+  const DEBUG = (() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('correctorDebug') === '1') return true;
+    } catch (_) {}
+    try {
+      return localStorage.getItem(DEBUG_STORAGE_KEY) === '1';
+    } catch (_) {
+      return false;
+    }
+  })();
   const _logs = [];
+
+  const isTextControl = (el) => {
+    if (!el || !(el instanceof HTMLElement)) return false;
+    if (el.tagName === 'TEXTAREA') return true;
+    if (el.tagName !== 'INPUT') return false;
+    return TEXT_INPUT_TYPES.has((el.type || 'text').toLowerCase());
+  };
+
+  const normalizeComparableText = (text) => (text || '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const hasMeaningfulSelection = (text) => (text || '').trim().length >= 3;
+
+  const getSelectionPadding = (text) => {
+    const value = text || '';
+    const leading = (value.match(/^\s*/) || [''])[0];
+    const trailing = (value.match(/\s*$/) || [''])[0];
+    return { leading, trailing };
+  };
 
   const dbg = (...a) => {
     if (!DEBUG) return;
@@ -97,8 +132,11 @@
 
   const TextCorrector = {
     selectedText:   '',
+    selectedRawText: '',
     selectedRange:  null,
     savedInputSel:  null,   // { start, end } capturé au déclenchement pour input/textarea
+    selectionPadding: { leading: '', trailing: '' },
+    selectionSource: null,
     menu:           null,
     pill:           null,
     currentRequest: null,
@@ -106,6 +144,55 @@
     previousFocus:  null,
     lastApply:      null,   // données pour le bouton Annuler
     _selChangeTid:  null,
+    _styleObserver: null,
+    correctionCache: new Map(),
+
+    getDomSelectionContext() {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) return null;
+      const rawText = sel.toString();
+      if (!hasMeaningfulSelection(rawText)) return null;
+      const range = sel.getRangeAt(0);
+      const rect = range.getBoundingClientRect();
+      if (!rect.width && !rect.height) return null;
+      return {
+        type: 'range',
+        text: rawText.trim(),
+        rawText,
+        range: range.cloneRange(),
+        rect,
+        padding: getSelectionPadding(rawText),
+      };
+    },
+
+    getControlSelectionContext() {
+      const el = document.activeElement;
+      if (!isTextControl(el)) return null;
+      if (typeof el.selectionStart !== 'number' || typeof el.selectionEnd !== 'number') return null;
+      const start = el.selectionStart;
+      const end = el.selectionEnd;
+      if (start === end) return null;
+      const rawText = el.value.slice(start, end);
+      if (!hasMeaningfulSelection(rawText)) return null;
+      return {
+        type: 'control',
+        text: rawText.trim(),
+        rawText,
+        el,
+        start,
+        end,
+        rect: el.getBoundingClientRect(),
+        padding: getSelectionPadding(rawText),
+      };
+    },
+
+    getSelectionContext() {
+      return this.getDomSelectionContext() || this.getControlSelectionContext();
+    },
+
+    getReplacementText(corrected) {
+      return `${this.selectionPadding.leading}${corrected}${this.selectionPadding.trailing}`;
+    },
 
     // ─────────────────────────────────────────────
     // Init
@@ -125,20 +212,30 @@
     // Support SPA
     // ─────────────────────────────────────────────
     watchNavigation() {
-      const wrap = (fn) => function (...a) {
-        const r = fn.apply(this, a);
-        window.dispatchEvent(new Event('_corrector_nav'));
-        return r;
-      };
-      history.pushState    = wrap(history.pushState);
-      history.replaceState = wrap(history.replaceState);
-      window.addEventListener('popstate',       () => window.dispatchEvent(new Event('_corrector_nav')));
-      window.addEventListener('_corrector_nav', () => { this.hidePill(); this.closeMenu(); });
+      if (!history[HISTORY_PATCH_FLAG]) {
+        const originalPushState = history.pushState.bind(history);
+        const originalReplaceState = history.replaceState.bind(history);
+        history.pushState = function (...args) {
+          const result = originalPushState(...args);
+          window.dispatchEvent(new Event(NAV_EVENT));
+          return result;
+        };
+        history.replaceState = function (...args) {
+          const result = originalReplaceState(...args);
+          window.dispatchEvent(new Event(NAV_EVENT));
+          return result;
+        };
+        history[HISTORY_PATCH_FLAG] = true;
+        window.addEventListener('popstate', () => window.dispatchEvent(new Event(NAV_EVENT)));
+      }
 
-      const obs = new MutationObserver(() => {
+      window.addEventListener(NAV_EVENT, () => { this.hidePill(); this.closeMenu(); });
+
+      if (this._styleObserver) return;
+      this._styleObserver = new MutationObserver(() => {
         if (this.styleEl && !document.contains(this.styleEl)) this.injectStyles();
       });
-      obs.observe(document.head || document.documentElement, { childList: true });
+      this._styleObserver.observe(document.head || document.documentElement, { childList: true });
     },
 
     // ─────────────────────────────────────────────
@@ -157,22 +254,16 @@
     },
 
     _checkSelectionAndShowPill() {
-      const sel  = window.getSelection();
-      const text = sel ? sel.toString().trim() : '';
-      if (!text || text.length < 3) { this.hidePill(); return; }
-      if (sel.rangeCount === 0) { this.hidePill(); return; }
-      const range = sel.getRangeAt(0);
-      const rect  = range.getBoundingClientRect();
-      if (!rect.width && !rect.height) { this.hidePill(); return; }
-      this.showPill(rect);
+      const context = this.getSelectionContext();
+      if (!context) { this.hidePill(); return; }
+      this.showPill(context.rect);
     },
 
     // Debounce : selectionchange se déclenche à chaque frappe sur toute la page
     handleSelectionChange() {
       clearTimeout(this._selChangeTid);
       this._selChangeTid = setTimeout(() => {
-        const sel = window.getSelection();
-        if (!sel || !sel.toString().trim()) this.hidePill();
+        if (!this.getSelectionContext()) this.hidePill();
       }, 80);
     },
 
@@ -182,18 +273,24 @@
       pill.className = 'corrector-pill';
       pill.setAttribute('aria-label', 'Corriger le texte sélectionné');
       pill.textContent = '\u270E Corriger';
-
-      // position:fixed → coordonnées viewport directes (getBoundingClientRect déjà relatives au viewport)
-      const pW = 112, pH = 30, gap = 8;
-      let x = rect.left + rect.width / 2 - pW / 2;
-      let y = rect.top - pH - gap;
-      if (rect.top - pH - gap < 0) y = rect.bottom + gap;
-      x = Math.max(8, Math.min(x, window.innerWidth - pW - 8));
-
-      pill.style.left = x + 'px';
-      pill.style.top  = y + 'px';
-      pill.addEventListener('mousedown', (e) => { e.preventDefault(); this.triggerCorrection(); });
+      pill.style.visibility = 'hidden';
+      pill.style.left = '0px';
+      pill.style.top = '0px';
+      pill.addEventListener('mousedown', (e) => e.preventDefault());
+      pill.addEventListener('click', () => this.triggerCorrection());
       document.body.appendChild(pill);
+
+      const pillRect = pill.getBoundingClientRect();
+      const gap = 8;
+      let x = rect.left + rect.width / 2 - pillRect.width / 2;
+      let y = rect.top - pillRect.height - gap;
+      if (y < 8) y = rect.bottom + gap;
+      x = Math.max(8, Math.min(x, window.innerWidth - pillRect.width - 8));
+      y = Math.max(8, Math.min(y, window.innerHeight - pillRect.height - 8));
+
+      pill.style.left = `${x}px`;
+      pill.style.top = `${y}px`;
+      pill.style.visibility = 'visible';
       this.pill = pill;
     },
 
@@ -202,23 +299,18 @@
     },
 
     triggerCorrection() {
-      const sel  = window.getSelection();
-      const text = sel ? sel.toString().trim() : '';
-      if (!text) return;
+      const context = this.getSelectionContext();
+      if (!context) return;
 
-      this.selectedText  = text;
+      this.selectedText = context.text;
+      this.selectedRawText = context.rawText;
       this.previousFocus = document.activeElement;
-      this.selectedRange = sel.rangeCount > 0 ? sel.getRangeAt(0).cloneRange() : null;
-
-      // Capture la position curseur input/textarea au moment du clic sur la bulle.
-      // Ne pas la relire dans applyCorrection : le curseur peut avoir bougé pendant la lecture du panneau.
-      const ae = document.activeElement;
-      if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA') &&
-          typeof ae.selectionStart === 'number') {
-        this.savedInputSel = { start: ae.selectionStart, end: ae.selectionEnd };
-      } else {
-        this.savedInputSel = null;
-      }
+      this.selectedRange = context.type === 'range' ? context.range : null;
+      this.savedInputSel = context.type === 'control'
+        ? { start: context.start, end: context.end }
+        : null;
+      this.selectionPadding = context.padding;
+      this.selectionSource = context;
 
       const pillRect = this.pill ? this.pill.getBoundingClientRect() : null;
       const savedPos = this.loadPosition();
@@ -228,7 +320,7 @@
         savedPos ? savedPos.x : (pillRect ? pillRect.left : 80),
         savedPos ? savedPos.y : (pillRect ? pillRect.bottom + 10 : 80)
       );
-      this.fetchCorrection(text);
+      this.fetchCorrection(this.selectedText);
     },
 
     // ─────────────────────────────────────────────
@@ -237,6 +329,12 @@
     fetchCorrection(text) {
       if (!this.menu) return;
       if (this.currentRequest) { this.currentRequest.abort(); this.currentRequest = null; }
+
+      const cacheKey = text;
+      if (this.correctionCache.has(cacheKey)) {
+        this.renderCorrection(text, this.correctionCache.get(cacheKey));
+        return;
+      }
 
       this.setLoadingState(true);
 
@@ -252,7 +350,11 @@
           if (!this.menu) return;
           this.setLoadingState(false);
           if (res.status < 200 || res.status >= 300) { this.showCorrectionError(); return; }
-          try { this.renderCorrection(text, JSON.parse(res.responseText).matches || []); }
+          try {
+            const matches = JSON.parse(res.responseText).matches || [];
+            this.correctionCache.set(cacheKey, matches);
+            this.renderCorrection(text, matches);
+          }
           catch (_) { this.showCorrectionError(); }
         },
         onerror: () => {
@@ -273,6 +375,7 @@
       const el = this.menu.querySelector('.corrector-correction-content');
       if (!el) return;
       if (loading) {
+        this.resetActionState();
         el.innerHTML = '<span class="corrector-spinner" aria-hidden="true"></span><span>Correction en cours\u2026</span>';
       }
     },
@@ -280,6 +383,7 @@
     showCorrectionError(msg) {
       const el = this.menu && this.menu.querySelector('.corrector-correction-content');
       if (!el) return;
+      this.resetActionState();
       const label = msg || 'Erreur : impossible de corriger.';
       el.innerHTML = '';
       const msgSpan = document.createElement('span');
@@ -298,6 +402,7 @@
     renderCorrection(text, matches) {
       if (!this.menu) return;
 
+      this.resetActionState();
       const valid     = matches.filter(m => m.replacements && m.replacements.length > 0);
       const corrected = this.applyMatches(text, valid);
 
@@ -377,8 +482,55 @@
       const sc = this.selectedRange.startContainer;
       const ec = this.selectedRange.endContainer;
       if (!sc.isConnected || !ec.isConnected) return false;
-      if (this.selectedRange.toString() !== this.selectedText) return false;
+      if (this.selectedRange.toString() !== this.selectedRawText) return false;
       return true;
+    },
+
+    isControlSelectionValid() {
+      if (!this.selectionSource || this.selectionSource.type !== 'control') return false;
+      const { el, start, end } = this.selectionSource;
+      if (!el || !el.isConnected) return false;
+      if (typeof el.value !== 'string') return false;
+      return el.value.slice(start, end) === this.selectedRawText;
+    },
+
+    resetActionState() {
+      if (!this.menu) return;
+      this.clearApplyError();
+
+      const title = this.menu.querySelector('.corrector-title');
+      title?.querySelectorAll('.corrector-badge').forEach((badge) => badge.remove());
+
+      const applyBtn = this.menu.querySelector('.corrector-apply-btn');
+      if (applyBtn) {
+        applyBtn.disabled = true;
+        delete applyBtn.dataset.corrected;
+      }
+
+      const copyBtn = this.menu.querySelector('.corrector-copy-btn');
+      if (copyBtn) {
+        copyBtn.style.display = 'none';
+        copyBtn.textContent = 'Copier';
+        delete copyBtn.dataset.text;
+      }
+    },
+
+    clearApplyError() {
+      this.menu?.querySelector('.corrector-apply-error')?.remove();
+    },
+
+    selectionMatchesWholeEditable(editableEl) {
+      return normalizeComparableText(this.selectedRawText) === normalizeComparableText(editableEl.textContent || '');
+    },
+
+    restoreSavedRangeSelection() {
+      if (!this.selectedRange) return false;
+      const sel = window.getSelection();
+      if (!sel) return false;
+      const range = this.selectedRange.cloneRange();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return sel.toString() === this.selectedRawText;
     },
 
     // ─────────────────────────────────────────────
@@ -417,8 +569,8 @@
       ].join('');
 
       menu.querySelector('.corrector-original-content').textContent = this.selectedText;
-      menu.style.left = Math.max(0, Math.min(x, window.innerWidth  - 300)) + 'px';
-      menu.style.top  = Math.max(0, Math.min(y, window.innerHeight - 200)) + 'px';
+      menu.style.left = `${Math.max(0, x)}px`;
+      menu.style.top = `${Math.max(0, y)}px`;
 
       // Boutons
       menu.querySelector('.corrector-apply-btn').addEventListener('click', (e) => {
@@ -452,6 +604,7 @@
 
       document.body.appendChild(menu);
       this.menu = menu;
+      this.resetActionState();
 
       // Drag
       this.makeDraggable(menu);
@@ -536,21 +689,25 @@
     // 3 stratégies selon le type d'élément cible
     // ─────────────────────────────────────────────
     applyCorrection(corrected) {
-      if (!this.selectedRange) { this.showApplyError('Sélection perdue. Resélectionnez le texte.'); return; }
+      if (!this.selectionSource) {
+        this.showApplyError('Sélection perdue. Resélectionnez le texte.');
+        return;
+      }
+
+      this.clearApplyError();
+      const replacementText = this.getReplacementText(corrected);
 
       try {
-        const anchor = this.selectedRange.commonAncestorContainer;
-        const parent = anchor.nodeType === Node.TEXT_NODE ? anchor.parentElement : anchor;
-        const sel    = window.getSelection();
-
         // ── Cas 1 : <input> ou <textarea> ──────────
-        const inputEl = parent && parent.closest('input, textarea');
-        if (inputEl && typeof inputEl.selectionStart === 'number') {
-          // Utilise la sélection capturée au déclenchement (pas la position courante qui a pu bouger)
-          const start = this.savedInputSel ? this.savedInputSel.start : inputEl.selectionStart;
-          const end   = this.savedInputSel ? this.savedInputSel.end   : inputEl.selectionEnd;
+        if (this.selectionSource.type === 'control') {
+          if (!this.isControlSelectionValid()) {
+            this.showApplyError('Le texte a changé depuis la sélection. Resélectionnez.');
+            return;
+          }
+          const inputEl = this.selectionSource.el;
+          const { start, end } = this.selectionSource;
           const originalValue = inputEl.value;
-          inputEl.setRangeText(corrected, start, end, 'end');
+          inputEl.setRangeText(replacementText, start, end, 'end');
           inputEl.dispatchEvent(new Event('input',  { bubbles: true }));
           inputEl.dispatchEvent(new Event('change', { bubbles: true }));
           this.lastApply = { type: 'input', el: inputEl, originalValue, start, end };
@@ -560,6 +717,15 @@
           return;
         }
 
+        if (!this.selectedRange) {
+          this.showApplyError('Sélection perdue. Resélectionnez le texte.');
+          return;
+        }
+
+        const anchor = this.selectedRange.commonAncestorContainer;
+        const parent = anchor.nodeType === Node.TEXT_NODE ? anchor.parentElement : anchor;
+        const sel    = window.getSelection();
+
         // ── Cas 2 : contenteditable ─────────────────
         const editableEl = parent && parent.closest('[contenteditable="true"], [contenteditable=""]');
         if (editableEl) {
@@ -568,8 +734,13 @@
             this.showApplyError('Le texte a changé depuis la sélection. Resélectionnez.');
             return;
           }
-          watchMutations(editableEl, 8000);
-          watchKeys(editableEl, 8000);
+          if (DEBUG) {
+            watchMutations(editableEl, 8000);
+            watchKeys(editableEl, 8000);
+          }
+
+          const originalEditableText = editableEl.textContent || '';
+          const safeWholeReplace = this.selectionMatchesWholeEditable(editableEl);
 
           const finalize = () => {
             this.lastApply = { type: 'contenteditable' };
@@ -579,192 +750,217 @@
             this.showConfirmation(false);
           };
 
+          const failEditableApply = () => {
+            this.showApplyError(
+              safeWholeReplace
+                ? 'Impossible de remplacer sur cet éditeur. Utilisez "Copier".'
+                : 'Remplacement partiel non fiable sur cet éditeur. Utilisez "Copier" ou sélectionnez tout le texte.'
+            );
+          };
+
+          const performEditableInsert = (prefix, onNoChange) => {
+            const finishAttempt = (label) => {
+              setTimeout(() => {
+                snap(label, editableEl);
+                if ((editableEl.textContent || '') !== originalEditableText) {
+                  finalize();
+                } else if (typeof onNoChange === 'function') {
+                  onNoChange();
+                } else {
+                  failEditableApply();
+                }
+              }, 30);
+            };
+
+            snap(`${prefix}_avant_beforeinput`, editableEl);
+            let beforeInputHandled = false;
+            try {
+              const beforeEvt = new InputEvent('beforeinput', {
+                bubbles: true,
+                cancelable: true,
+                inputType: 'insertText',
+                data: replacementText,
+              });
+              beforeInputHandled = !editableEl.dispatchEvent(beforeEvt);
+              snap(`${prefix}_beforeinput_handled=${beforeInputHandled}`, editableEl);
+            } catch (err) {
+              dbg(`${prefix} beforeinput error: ${err.message}`);
+            }
+
+            if (beforeInputHandled) {
+              finishAttempt(`${prefix}_apres_beforeinput`);
+              return;
+            }
+
+            const execOk = document.execCommand('insertText', false, replacementText);
+            snap(`${prefix}_exec_ok=${execOk}`, editableEl);
+            if (execOk) {
+              finishAttempt(`${prefix}_apres_exec`);
+              return;
+            }
+
+            try {
+              const dt = new DataTransfer();
+              dt.setData('text/plain', replacementText);
+              const pasteEvt = new ClipboardEvent('paste', {
+                bubbles: true,
+                cancelable: true,
+                clipboardData: dt,
+              });
+              const pasteHandled = !editableEl.dispatchEvent(pasteEvt);
+              snap(`${prefix}_paste_handled=${pasteHandled}`, editableEl);
+            } catch (err) {
+              dbg(`${prefix} paste error: ${err.message}`);
+            }
+
+            finishAttempt(`${prefix}_apres_fallbacks`);
+          };
+
+          const runWholeEditorFallback = () => {
+            if (!safeWholeReplace) {
+              failEditableApply();
+              return;
+            }
+            editableEl.focus();
+            snap('C_focus_full', editableEl);
+            setTimeout(() => {
+              document.execCommand('selectAll');
+              snap('C_selectAll_full', editableEl);
+              setTimeout(() => performEditableInsert('C_full'), 25);
+            }, 30);
+          };
+
           // ── Stratégie A : fiber React → remplacement direct du ContentState ──
           let usedDraftFiber = false;
-          try {
-            const allKeys = Object.getOwnPropertyNames(editableEl);
-            const rKey = allKeys.find(k =>
-              k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
-            );
-            dbg('fiber: rKey=' + (rKey ? rKey.slice(0, 30) : 'null'));
-
-            if (rKey) {
-              const isES = (v) => v && typeof v === 'object' && (
-                (typeof v.getSelection === 'function' && typeof v.getCurrentContent === 'function') ||
-                (typeof v.get === 'function' && typeof v.merge === 'function' && typeof v.set === 'function')
+          if (safeWholeReplace) {
+            try {
+              const allKeys = Object.getOwnPropertyNames(editableEl);
+              const rKey = allKeys.find(k =>
+                k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
               );
+              dbg('fiber: rKey=' + (rKey ? rKey.slice(0, 30) : 'null'));
 
-              let fiber = editableEl[rKey];
-              let depth = 0;
-              let draftProps = null;
+              if (rKey) {
+                const isES = (v) => v && typeof v === 'object' && (
+                  (typeof v.getSelection === 'function' && typeof v.getCurrentContent === 'function') ||
+                  (typeof v.get === 'function' && typeof v.merge === 'function' && typeof v.set === 'function')
+                );
 
-              while (fiber && depth < 300 && !draftProps) {
-                // ① memoizedProps : scan toutes les props pour trouver un EditorState
-                const p = fiber.memoizedProps;
-                if (p && typeof p === 'object') {
-                  for (const k of Object.keys(p)) {
-                    if (isES(p[k])) {
-                      const onCh = typeof p.onChange === 'function' ? p.onChange
-                                 : typeof p.onEditorStateChange === 'function' ? p.onEditorStateChange
-                                 : null;
-                      if (onCh) {
-                        dbg('fiber: editorState prop="' + k + '" at depth=' + depth);
-                        draftProps = { editorState: p[k], onChange: onCh };
-                        break;
-                      }
-                    }
-                  }
-                }
+                let fiber = editableEl[rKey];
+                let depth = 0;
+                let draftProps = null;
 
-                // ② stateNode : instance de classe (DraftEditor ou composant parent)
-                if (!draftProps) {
-                  const inst = fiber.stateNode;
-                  if (inst && typeof inst === 'object' && !(inst instanceof Element)) {
-                    // DraftEditor via getEditorKey
-                    if (typeof inst.getEditorKey === 'function' &&
-                        inst.props && isES(inst.props.editorState) &&
-                        typeof inst.props.onChange === 'function') {
-                      dbg('fiber: DraftEditor stateNode at depth=' + depth);
-                      draftProps = { editorState: inst.props.editorState, onChange: inst.props.onChange };
-                    }
-                    // Composant parent avec editorState en state
-                    if (!draftProps && inst.state && typeof inst.state === 'object') {
-                      for (const k of Object.keys(inst.state)) {
-                        if (isES(inst.state[k]) && typeof inst.setState === 'function') {
-                          dbg('fiber: stateNode.state["' + k + '"] at depth=' + depth);
-                          const sk = k, si = inst;
-                          draftProps = { editorState: inst.state[k], onChange: (es) => si.setState({ [sk]: es }) };
+                while (fiber && depth < 300 && !draftProps) {
+                  const p = fiber.memoizedProps;
+                  if (p && typeof p === 'object') {
+                    for (const k of Object.keys(p)) {
+                      if (isES(p[k])) {
+                        const onCh = typeof p.onChange === 'function' ? p.onChange
+                                   : typeof p.onEditorStateChange === 'function' ? p.onEditorStateChange
+                                   : null;
+                        if (onCh) {
+                          dbg('fiber: editorState prop="' + k + '" at depth=' + depth);
+                          draftProps = { editorState: p[k], onChange: onCh };
                           break;
                         }
                       }
                     }
                   }
+
+                  if (!draftProps) {
+                    const inst = fiber.stateNode;
+                    if (inst && typeof inst === 'object' && !(inst instanceof Element)) {
+                      if (typeof inst.getEditorKey === 'function' &&
+                          inst.props && isES(inst.props.editorState) &&
+                          typeof inst.props.onChange === 'function') {
+                        dbg('fiber: DraftEditor stateNode at depth=' + depth);
+                        draftProps = { editorState: inst.props.editorState, onChange: inst.props.onChange };
+                      }
+                      if (!draftProps && inst.state && typeof inst.state === 'object') {
+                        for (const k of Object.keys(inst.state)) {
+                          if (isES(inst.state[k]) && typeof inst.setState === 'function') {
+                            dbg('fiber: stateNode.state["' + k + '"] at depth=' + depth);
+                            const sk = k;
+                            const si = inst;
+                            draftProps = { editorState: inst.state[k], onChange: (es) => si.setState({ [sk]: es }) };
+                            break;
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  if (!draftProps) {
+                    let hook = fiber.memoizedState;
+                    let hi = 0;
+                    while (hook && hi < 20) {
+                      if (isES(hook.memoizedState) && hook.queue?.dispatch) {
+                        dbg('fiber: hook[' + hi + '] at depth=' + depth);
+                        draftProps = { editorState: hook.memoizedState, onChange: hook.queue.dispatch };
+                        break;
+                      }
+                      hook = hook.next;
+                      hi++;
+                    }
+                  }
+
+                  if (!draftProps && depth % 50 === 0 && depth > 0) {
+                    const p2 = fiber.memoizedProps;
+                    dbg('fiber: depth=' + depth + ' hasOnChange=' + !!(p2 && typeof p2.onChange === 'function'));
+                  }
+
+                  if (!draftProps) { fiber = fiber.return; depth++; }
                 }
 
-                // ③ hooks useState
-                if (!draftProps) {
-                  let hook = fiber.memoizedState;
-                  let hi = 0;
-                  while (hook && hi < 20) {
-                    if (isES(hook.memoizedState) && hook.queue?.dispatch) {
-                      dbg('fiber: hook[' + hi + '] at depth=' + depth);
-                      draftProps = { editorState: hook.memoizedState, onChange: hook.queue.dispatch };
-                      break;
-                    }
-                    hook = hook.next;
-                    hi++;
+                dbg('fiber: found=' + !!draftProps + ' depth=' + depth + ' fiberNull=' + !fiber);
+
+                if (draftProps) {
+                  const { editorState, onChange } = draftProps;
+                  const getContent = () => editorState.getCurrentContent
+                    ? editorState.getCurrentContent()
+                    : editorState.get('currentContent');
+                  const cs  = getContent();
+                  const sel = editorState.getSelection ? editorState.getSelection() : editorState.get('selection');
+                  const CS  = cs.constructor;
+                  const ES  = editorState.constructor;
+
+                  dbg('fiber: CS.createFromText=' + typeof CS.createFromText + ' ES.createWithContent=' + typeof ES.createWithContent);
+
+                  if (typeof CS.createFromText === 'function' && typeof ES.createWithContent === 'function') {
+                    const newContent = CS.createFromText(replacementText);
+                    const lastBlk    = newContent.getLastBlock ? newContent.getLastBlock()
+                                     : newContent.get('blockMap').last();
+                    const blkKey = lastBlk.getKey ? lastBlk.getKey() : lastBlk.get('key');
+                    const blkLen = lastBlk.getLength ? lastBlk.getLength() : lastBlk.get('text').length;
+                    const newSel = sel.merge({
+                      anchorKey: blkKey, anchorOffset: blkLen,
+                      focusKey:  blkKey, focusOffset:  blkLen,
+                      hasFocus: true, isBackward: false,
+                    });
+                    onChange(ES.forceSelection(ES.createWithContent(newContent), newSel));
+                    snap('B_draft_content_replaced', editableEl);
+                    usedDraftFiber = true;
+                    setTimeout(() => { editableEl.focus(); finalize(); }, 30);
                   }
                 }
-
-                // checkpoint debug tous les 50 niveaux
-                if (!draftProps && depth % 50 === 0 && depth > 0) {
-                  const p2 = fiber.memoizedProps;
-                  dbg('fiber: depth=' + depth + ' hasOnChange=' + !!(p2 && typeof p2.onChange === 'function'));
-                }
-
-                if (!draftProps) { fiber = fiber.return; depth++; }
               }
-
-              dbg('fiber: found=' + !!draftProps + ' depth=' + depth + ' fiberNull=' + !fiber);
-
-              if (draftProps) {
-                const { editorState, onChange } = draftProps;
-                const getContent = () => editorState.getCurrentContent
-                  ? editorState.getCurrentContent()
-                  : editorState.get('currentContent');
-                const cs  = getContent();
-                const sel = editorState.getSelection ? editorState.getSelection() : editorState.get('selection');
-                const CS  = cs.constructor;
-                const ES  = editorState.constructor;
-
-                dbg('fiber: CS.createFromText=' + typeof CS.createFromText + ' ES.createWithContent=' + typeof ES.createWithContent);
-
-                if (typeof CS.createFromText === 'function' && typeof ES.createWithContent === 'function') {
-                  const newContent = CS.createFromText(corrected);
-                  const lastBlk    = newContent.getLastBlock ? newContent.getLastBlock()
-                                   : newContent.get('blockMap').last();
-                  const blkKey = lastBlk.getKey ? lastBlk.getKey() : lastBlk.get('key');
-                  const blkLen = lastBlk.getLength ? lastBlk.getLength() : lastBlk.get('text').length;
-                  const newSel = sel.merge({
-                    anchorKey: blkKey, anchorOffset: blkLen,
-                    focusKey:  blkKey, focusOffset:  blkLen,
-                    hasFocus: true, isBackward: false,
-                  });
-                  onChange(ES.forceSelection(ES.createWithContent(newContent), newSel));
-                  snap('B_draft_content_replaced', editableEl);
-                  usedDraftFiber = true;
-                  setTimeout(() => { editableEl.focus(); finalize(); }, 30);
-                }
-              }
-            }
-          } catch (e) { dbg('fiber error: ' + e.message + ' | ' + (e.stack || '').slice(0, 100)); }
+            } catch (e) { dbg('fiber error: ' + e.message + ' | ' + (e.stack || '').slice(0, 100)); }
+          }
 
           if (usedDraftFiber) return;
 
-          // ── Stratégie B : selectAll → beforeinput(insertText) ─────────────────
-          // Twitch's paste handler fait toujours insertText (append) jamais replaceText.
-          // Draft.js traite avant tout le beforeinput avec sa SelectionState interne.
+          // ── Stratégie B : restaurer la vraie sélection puis beforeinput ────────
           editableEl.focus();
           snap('B_focus_done', editableEl);
           setTimeout(() => {
-            document.execCommand('selectAll');
-            snap('B2_apres_selectAll', editableEl);
-
-            // Draft.js traite selectionchange → SelectionState = "tout sélectionné"
+            const restored = this.restoreSavedRangeSelection();
+            snap('B2_restore_selection=' + restored, editableEl);
+            if (!restored) {
+              runWholeEditorFallback();
+              return;
+            }
             setTimeout(() => {
-              editableEl.focus();
-              snap('B3_avant_beforeinput', editableEl);
-
-              let beforeInputHandled = false;
-              try {
-                const beforeEvt = new InputEvent('beforeinput', {
-                  bubbles: true,
-                  cancelable: true,
-                  inputType: 'insertText',
-                  data: corrected,
-                });
-                beforeInputHandled = !editableEl.dispatchEvent(beforeEvt);
-                snap('B4_beforeinput_handled=' + beforeInputHandled, editableEl);
-              } catch (err) {
-                dbg('beforeinput error: ' + err.message);
-              }
-
-              if (beforeInputHandled) {
-                setTimeout(() => {
-                  snap('B5_apres_beforeinput', editableEl);
-                  finalize();
-                }, 30);
-                return;
-              }
-
-              const execOk = document.execCommand('insertText', false, corrected);
-              snap('C_execCommand_ok=' + execOk, editableEl);
-              if (execOk) {
-                setTimeout(() => {
-                  snap('C2_apres_execCommand', editableEl);
-                  finalize();
-                }, 30);
-                return;
-              }
-
-              try {
-                const dt = new DataTransfer();
-                dt.setData('text/plain', corrected);
-                const pasteEvt = new ClipboardEvent('paste', {
-                  bubbles: true,
-                  cancelable: true,
-                  clipboardData: dt,
-                });
-                const pasteHandled = !editableEl.dispatchEvent(pasteEvt);
-                snap('D_paste_dispatched_handled=' + pasteHandled, editableEl);
-              } catch (err) {
-                dbg('paste error: ' + err.message);
-              }
-
-              setTimeout(() => {
-                snap('E_apres_fallbacks', editableEl);
-                finalize();
-              }, 30);
+              performEditableInsert('B_selection', safeWholeReplace ? runWholeEditorFallback : null);
             }, 25);
           }, 30);
           return;
@@ -777,7 +973,7 @@
         }
         const originalText = this.selectedRange.toString();
         this.selectedRange.deleteContents();
-        const textNode = document.createTextNode(corrected);
+        const textNode = document.createTextNode(replacementText);
         this.selectedRange.insertNode(textNode);
 
         const newRange = document.createRange();
@@ -891,8 +1087,12 @@
         this.menu = null;
         if (this.previousFocus && typeof this.previousFocus.focus === 'function') this.previousFocus.focus();
         this.previousFocus = null;
+        this.selectedText = '';
+        this.selectedRawText = '';
         this.selectedRange = null;
         this.savedInputSel = null;
+        this.selectionPadding = { leading: '', trailing: '' };
+        this.selectionSource = null;
       }
     },
 
@@ -1085,6 +1285,14 @@
         }
         .corrector-copy-btn:hover { background: #16a34a; color: #fff; }
 
+        .corrector-debug-btn {
+          cursor: pointer; padding: 6px 14px;
+          border: 1.5px solid #f59e0b; background: transparent;
+          color: #b45309; border-radius: 6px; font-size: 13px;
+          transition: background .15s, color .15s;
+        }
+        .corrector-debug-btn:hover { background: #f59e0b; color: #fff; }
+
         .corrector-cancel-btn {
           cursor: pointer; padding: 6px 14px;
           border: 1.5px solid #e5e7eb; background: #f9fafb;
@@ -1103,6 +1311,8 @@
           .corrector-label              { color:#71717a; }
           .corrector-original-content   { background:#27272a; border-color:#3f3f46; color:#a1a1aa; }
           .corrector-correction-content { background:#1e3a5f; border-color:#1d4ed8; color:#93c5fd; }
+          .corrector-debug-btn          { border-color:#f59e0b; color:#fbbf24; }
+          .corrector-debug-btn:hover    { background:#f59e0b; color:#18181b; }
           .corrector-cancel-btn         { background:#27272a; border-color:#3f3f46; color:#d4d4d8; }
           .corrector-cancel-btn:hover   { background:#3f3f46; }
           .corrector-actions            { border-color:#3f3f46; }
