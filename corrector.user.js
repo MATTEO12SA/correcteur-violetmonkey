@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.6.0
+// @version        4.6.1
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -68,8 +68,9 @@
 
   let debugEnabled = URL_DEBUG_ENABLED || readStoredFlag(DEBUG_STORAGE_KEY);
   let confirmationEnabled = readStoredFlag(CONFIRMATION_STORAGE_KEY);
-  let correctionMode = CORRECTION_MODES.has(readStoredValue(CORRECTION_MODE_STORAGE_KEY))
-    ? readStoredValue(CORRECTION_MODE_STORAGE_KEY)
+  const storedCorrectionMode = readStoredValue(CORRECTION_MODE_STORAGE_KEY);
+  let correctionMode = CORRECTION_MODES.has(storedCorrectionMode)
+    ? storedCorrectionMode
     : DEFAULT_CORRECTION_MODE;
   const _logs = [];
 
@@ -184,6 +185,7 @@
     selectionPadding: { leading: '', trailing: '' },
     selectionSource: null,
     menu:           null,
+    menuRefs:       null,
     pill:           null,
     currentRequest: null,
     styleEl:        null,
@@ -258,9 +260,9 @@
     },
 
     toggleSettingsPanel(force) {
-      if (!this.menu) return;
-      const panel = this.menu.querySelector('.corrector-settings-panel');
-      const btn = this.menu.querySelector('.corrector-settings-btn');
+      const refs = this.getMenuRefs();
+      if (!refs) return;
+      const { settingsPanel: panel, settingsBtn: btn } = refs;
       if (!panel || !btn) return;
       const shouldOpen = typeof force === 'boolean' ? force : panel.hidden;
       panel.hidden = !shouldOpen;
@@ -269,16 +271,16 @@
     },
 
     syncSettingsPanel() {
-      if (!this.menu) return;
-      const panel = this.menu.querySelector('.corrector-settings-panel');
-      if (!panel) return;
-
-      const debugInput = panel.querySelector('.corrector-setting-debug');
-      const confirmInput = panel.querySelector('.corrector-setting-confirmation');
-      const modeInput = panel.querySelector('.corrector-setting-mode');
-      const modeHelp = panel.querySelector('.corrector-mode-help');
-      const downloadBtn = panel.querySelector('.corrector-download-logs-btn');
-      const status = panel.querySelector('.corrector-settings-status');
+      const refs = this.getMenuRefs();
+      if (!refs) return;
+      const {
+        debugInput,
+        confirmInput,
+        modeInput,
+        modeHelp,
+        downloadLogsBtn: downloadBtn,
+        settingsStatus: status,
+      } = refs;
 
       if (debugInput) debugInput.checked = debugEnabled;
       if (confirmInput) confirmInput.checked = confirmationEnabled;
@@ -290,6 +292,49 @@
           ? (_logs.length ? 'Logs actifs. Clique sur "Télécharger les logs" après avoir reproduit le bug.' : 'Logs actifs. Reproduis le bug puis télécharge le fichier.')
           : 'Logs désactivés. Active-les ici si tu veux un fichier de debug.';
       }
+    },
+
+    cacheMenuRefs(menu) {
+      if (!menu) {
+        this.menuRefs = null;
+        return null;
+      }
+      this.menuRefs = {
+        root: menu,
+        title: menu.querySelector('.corrector-title'),
+        settingsBtn: menu.querySelector('.corrector-settings-btn'),
+        closeBtn: menu.querySelector('.corrector-close-btn'),
+        settingsPanel: menu.querySelector('.corrector-settings-panel'),
+        debugInput: menu.querySelector('.corrector-setting-debug'),
+        confirmInput: menu.querySelector('.corrector-setting-confirmation'),
+        modeInput: menu.querySelector('.corrector-setting-mode'),
+        modeHelp: menu.querySelector('.corrector-mode-help'),
+        downloadLogsBtn: menu.querySelector('.corrector-download-logs-btn'),
+        settingsStatus: menu.querySelector('.corrector-settings-status'),
+        originalContent: menu.querySelector('.corrector-original-content'),
+        correctionContent: menu.querySelector('.corrector-correction-content'),
+        applyBtn: menu.querySelector('.corrector-apply-btn'),
+        copyBtn: menu.querySelector('.corrector-copy-btn'),
+        cancelBtn: menu.querySelector('.corrector-cancel-btn'),
+        actions: menu.querySelector('.corrector-actions'),
+        header: menu.querySelector('.corrector-header'),
+        applyError: menu.querySelector('.corrector-apply-error'),
+      };
+      this.menuRefs.focusableButtons = [
+        this.menuRefs.settingsBtn,
+        this.menuRefs.closeBtn,
+        this.menuRefs.downloadLogsBtn,
+        this.menuRefs.applyBtn,
+        this.menuRefs.copyBtn,
+        this.menuRefs.cancelBtn,
+      ].filter(Boolean);
+      return this.menuRefs;
+    },
+
+    getMenuRefs() {
+      if (!this.menu) return null;
+      if (this.menuRefs?.root === this.menu) return this.menuRefs;
+      return this.cacheMenuRefs(this.menu);
     },
 
     getDomSelectionContext() {
@@ -589,6 +634,22 @@
       return String(match?.rule?.id || '').toUpperCase();
     },
 
+    createMatchInfo(match, text) {
+      const offset = match.offset;
+      const length = match.length;
+      const original = text.slice(offset, offset + length);
+      return {
+        match,
+        offset,
+        length,
+        original,
+        issueType: this.getMatchIssueType(match),
+        categoryId: this.getMatchCategoryId(match),
+        ruleId: this.getMatchRuleId(match),
+        originalWordCount: this.countWords(original),
+      };
+    },
+
     isSentenceStart(text, offset) {
       const before = (text || '').slice(0, offset).trimEnd();
       return !before || /[.!?…]\s*$/.test(before);
@@ -621,23 +682,19 @@
       return replacement;
     },
 
-    isReplacementSafe(match, replacement, original, context) {
+    isReplacementSafe(matchInfo, replacement, replacementWordCount, context) {
+      const { original, originalWordCount, issueType } = matchInfo;
       if (!replacement || replacement === original) return false;
-      const originalWords = this.countWords(original);
-      const replacementWords = this.countWords(replacement);
-      const issueType = this.getMatchIssueType(match);
 
       if (context.mode !== 'strict' && replacement.length > Math.max(original.length * 3, original.length + 24)) return false;
-      if (context.mode === 'chat-lite' && replacementWords > Math.max(originalWords + 2, 4) && replacement.length > original.length + 10) return false;
+      if (context.mode === 'chat-lite' && replacementWordCount > Math.max(originalWordCount + 2, 4) && replacement.length > original.length + 10) return false;
       if (context.profile.chatLike && issueType === 'style') return false;
       if (context.profile.chatLike && /[A-Z]{3,}/.test(replacement) && !/[A-Z]{3,}/.test(original)) return false;
       return true;
     },
 
-    scoreReplacementCandidate(match, replacement, original, context) {
-      const issueType = this.getMatchIssueType(match);
-      const originalWords = this.countWords(original);
-      const replacementWords = this.countWords(replacement);
+    scoreReplacementCandidate(matchInfo, replacement, replacementWordCount, context) {
+      const { issueType, original, originalWordCount } = matchInfo;
       let score = 100;
 
       if (issueType === 'misspelling') score += 16;
@@ -647,14 +704,14 @@
       else if (issueType === 'style') score -= 18;
 
       score -= Math.abs(replacement.length - original.length);
-      score -= Math.max(0, replacementWords - originalWords) * (context.mode === 'chat-lite' ? 6 : 3);
+      score -= Math.max(0, replacementWordCount - originalWordCount) * (context.mode === 'chat-lite' ? 6 : 3);
       if (context.profile.chatLike && replacement.length > original.length + 8) score -= 10;
       if (replacement.includes('\n')) score -= 20;
       return score;
     },
 
-    pickReplacement(match, text, context) {
-      const original = text.slice(match.offset, match.offset + match.length);
+    pickReplacement(matchInfo, text, context) {
+      const { match, original, offset } = matchInfo;
       const candidates = [];
       for (const replacement of (match.replacements || []).slice(0, 5)) {
         const value = replacement && typeof replacement.value === 'string'
@@ -666,17 +723,17 @@
 
       let best = null;
       for (const candidate of candidates) {
-        const normalized = this.normalizeReplacementCasing(original, candidate, text, match.offset);
-        if (!this.isReplacementSafe(match, normalized, original, context)) continue;
-        const score = this.scoreReplacementCandidate(match, normalized, original, context);
+        const normalized = this.normalizeReplacementCasing(original, candidate, text, offset);
+        const replacementWordCount = this.countWords(normalized);
+        if (!this.isReplacementSafe(matchInfo, normalized, replacementWordCount, context)) continue;
+        const score = this.scoreReplacementCandidate(matchInfo, normalized, replacementWordCount, context);
         if (!best || score > best.score) best = { value: normalized, score };
       }
       return best ? best.value : null;
     },
 
-    scorePreparedMatch(match, replacementValue, context) {
-      const issueType = this.getMatchIssueType(match);
-      const categoryId = this.getMatchCategoryId(match);
+    scorePreparedMatch(matchInfo, replacementValue, context) {
+      const { issueType, categoryId, length } = matchInfo;
       let score = 40;
 
       if (issueType === 'misspelling') score += 50;
@@ -691,19 +748,15 @@
       if (categoryId.includes('CASING')) score += 6;
       if (categoryId.includes('STYLE')) score -= 14;
       if (context.profile.chatLike && (issueType === 'misspelling' || issueType === 'grammar')) score += 6;
-      if (context.profile.chatLike && replacementValue.length > match.length + 8) score -= 10;
+      if (context.profile.chatLike && replacementValue.length > length + 8) score -= 10;
       return score;
     },
 
-    shouldKeepMatch(match, replacementValue, text, context) {
-      if (!match || !replacementValue) return false;
+    shouldKeepMatch(matchInfo, replacementValue, context) {
+      if (!matchInfo || !replacementValue) return false;
 
-      const start = match.offset;
-      const end = match.offset + match.length;
-      const issueType = this.getMatchIssueType(match);
-      const categoryId = this.getMatchCategoryId(match);
-      const ruleId = this.getMatchRuleId(match);
-      const original = text.slice(start, end);
+      const { offset: start, length, issueType, categoryId, ruleId, original } = matchInfo;
+      const end = start + length;
 
       if (this.rangesOverlap(start, end, context.protectedRanges)) return false;
       if (context.mode !== 'strict') {
@@ -770,8 +823,8 @@
     },
 
     setLoadingState(loading) {
-      if (!this.menu) return;
-      const el = this.menu.querySelector('.corrector-correction-content');
+      const refs = this.getMenuRefs();
+      const el = refs?.correctionContent;
       if (!el) return;
       if (loading) {
         this.resetActionState();
@@ -780,7 +833,8 @@
     },
 
     showCorrectionError(msg) {
-      const el = this.menu && this.menu.querySelector('.corrector-correction-content');
+      const refs = this.getMenuRefs();
+      const el = refs?.correctionContent;
       if (!el) return;
       this.resetActionState();
       const label = msg || 'Erreur : impossible de corriger.';
@@ -799,7 +853,8 @@
     // Rendu du diff
     // ─────────────────────────────────────────────
     renderCorrection(text, matches, correctionContext = this.createCorrectionContext(text)) {
-      if (!this.menu) return;
+      const refs = this.getMenuRefs();
+      if (!refs) return;
 
       this.resetActionState();
       const preparedMatches = this.prepareMatches(text, matches, correctionContext);
@@ -810,11 +865,11 @@
         const badge = document.createElement('span');
         badge.className   = 'corrector-badge';
         badge.textContent = preparedMatches.length + ' erreur' + (preparedMatches.length > 1 ? 's' : '');
-        this.menu.querySelector('.corrector-title').appendChild(badge);
+        refs.title?.appendChild(badge);
       }
 
       // Texte original avec erreurs soulignées
-      const origEl = this.menu.querySelector('.corrector-original-content');
+      const origEl = refs.originalContent;
       origEl.replaceChildren(...this.buildSpans(text, preparedMatches, (m) => {
         const s = document.createElement('span');
         s.className   = 'corrector-error';
@@ -824,7 +879,7 @@
       }));
 
       // Correction
-      const corrEl = this.menu.querySelector('.corrector-correction-content');
+      const corrEl = refs.correctionContent;
       if (corrected === text) {
         const ok = document.createElement('span');
         ok.className   = 'corrector-ok';
@@ -838,12 +893,12 @@
           return s;
         }));
 
-        const applyBtn = this.menu.querySelector('.corrector-apply-btn');
+        const applyBtn = refs.applyBtn;
         applyBtn.disabled = false;
         applyBtn.dataset.corrected = corrected;
         applyBtn.focus();
 
-        const copyBtn = this.menu.querySelector('.corrector-copy-btn');
+        const copyBtn = refs.copyBtn;
         copyBtn.style.display = 'inline-block';
         copyBtn.dataset.text  = corrected;
       }
@@ -853,12 +908,16 @@
       const candidates = (matches || [])
         .filter((match) => match && Array.isArray(match.replacements) && match.replacements.length > 0)
         .map((match) => {
-          const replacementValue = this.pickReplacement(match, text, correctionContext);
-          if (!this.shouldKeepMatch(match, replacementValue, text, correctionContext)) return null;
+          const matchInfo = this.createMatchInfo(match, text);
+          const replacementValue = this.pickReplacement(matchInfo, text, correctionContext);
+          if (!this.shouldKeepMatch(matchInfo, replacementValue, correctionContext)) return null;
           return {
-            ...match,
+            ...matchInfo.match,
             replacementValue,
-            priority: this.scorePreparedMatch(match, replacementValue, correctionContext),
+            issueType: matchInfo.issueType,
+            categoryId: matchInfo.categoryId,
+            ruleId: matchInfo.ruleId,
+            priority: this.scorePreparedMatch(matchInfo, replacementValue, correctionContext),
           };
         })
         .filter(Boolean)
@@ -919,19 +978,19 @@
     },
 
     resetActionState() {
-      if (!this.menu) return;
+      const refs = this.getMenuRefs();
+      if (!refs) return;
       this.clearApplyError();
 
-      const title = this.menu.querySelector('.corrector-title');
-      title?.querySelectorAll('.corrector-badge').forEach((badge) => badge.remove());
+      refs.title?.querySelectorAll('.corrector-badge').forEach((badge) => badge.remove());
 
-      const applyBtn = this.menu.querySelector('.corrector-apply-btn');
+      const applyBtn = refs.applyBtn;
       if (applyBtn) {
         applyBtn.disabled = true;
         delete applyBtn.dataset.corrected;
       }
 
-      const copyBtn = this.menu.querySelector('.corrector-copy-btn');
+      const copyBtn = refs.copyBtn;
       if (copyBtn) {
         copyBtn.style.display = 'none';
         copyBtn.textContent = 'Copier';
@@ -940,7 +999,10 @@
     },
 
     clearApplyError() {
-      this.menu?.querySelector('.corrector-apply-error')?.remove();
+      const refs = this.getMenuRefs();
+      if (!refs?.applyError) return;
+      refs.applyError.remove();
+      refs.applyError = null;
     },
 
     selectionMatchesWholeEditable(editableEl) {
@@ -1015,16 +1077,18 @@
         '</div>',
       ].join('');
 
-      menu.querySelector('.corrector-original-content').textContent = this.selectedText;
+      this.cacheMenuRefs(menu);
+      const refs = this.menuRefs;
+      refs.originalContent.textContent = this.selectedText;
       menu.style.left = `${Math.max(0, x)}px`;
       menu.style.top = `${Math.max(0, y)}px`;
 
       // Boutons
-      menu.querySelector('.corrector-apply-btn').addEventListener('click', (e) => {
+      refs.applyBtn.addEventListener('click', (e) => {
         const c = e.currentTarget.dataset.corrected;
         if (c) this.applyCorrection(c);
       });
-      menu.querySelector('.corrector-copy-btn').addEventListener('click', (e) => {
+      refs.copyBtn.addEventListener('click', (e) => {
         const txt = e.currentTarget.dataset.text;
         if (!txt) return;
         const btn = e.currentTarget;
@@ -1044,26 +1108,27 @@
         });
       });
       const close = () => this.closeMenu();
-      menu.querySelector('.corrector-cancel-btn').addEventListener('click', close);
-      menu.querySelector('.corrector-close-btn').addEventListener('click',  close);
-      menu.querySelector('.corrector-settings-btn').addEventListener('click', (e) => {
+      refs.cancelBtn.addEventListener('click', close);
+      refs.closeBtn.addEventListener('click',  close);
+      refs.settingsBtn.addEventListener('click', (e) => {
         e.preventDefault();
         this.toggleSettingsPanel();
       });
-      menu.querySelector('.corrector-setting-debug').addEventListener('change', (e) => {
+      refs.debugInput.addEventListener('change', (e) => {
         this.setDebugEnabled(e.currentTarget.checked);
       });
-      menu.querySelector('.corrector-setting-confirmation').addEventListener('change', (e) => {
+      refs.confirmInput.addEventListener('change', (e) => {
         this.setConfirmationEnabled(e.currentTarget.checked);
       });
-      menu.querySelector('.corrector-setting-mode').addEventListener('change', (e) => {
+      refs.modeInput.addEventListener('change', (e) => {
         this.setCorrectionMode(e.currentTarget.value);
       });
-      menu.querySelector('.corrector-download-logs-btn').addEventListener('click', () => downloadLogs());
+      refs.downloadLogsBtn.addEventListener('click', () => downloadLogs());
       menu.addEventListener('keydown', (e) => this.handleMenuKeyDown(e));
 
       document.body.appendChild(menu);
       this.menu = menu;
+      this.cacheMenuRefs(menu);
       this.resetActionState();
       this.syncSettingsPanel();
 
@@ -1072,7 +1137,7 @@
 
       requestAnimationFrame(() => {
         this.adjustMenuPosition(menu);
-        menu.querySelector('.corrector-cancel-btn').focus();
+        refs.cancelBtn.focus();
       });
     },
 
@@ -1080,7 +1145,7 @@
     // Drag & drop + sauvegarde position
     // ─────────────────────────────────────────────
     makeDraggable(menu) {
-      const header = menu.querySelector('.corrector-header');
+      const header = this.getMenuRefs()?.header || menu.querySelector('.corrector-header');
       let startX, startY, startLeft, startTop;
 
       const onMove = (e) => {
@@ -1133,7 +1198,8 @@
     handleMenuKeyDown(e) {
       if (e.key === 'Escape') { this.closeMenu(); return; }
       if (e.key !== 'Tab') return;
-      const btns  = Array.from(this.menu.querySelectorAll('button:not(:disabled)'));
+      const refs = this.getMenuRefs();
+      const btns  = (refs?.focusableButtons || []).filter((btn) => btn.isConnected && !btn.disabled && btn.offsetParent !== null);
       const first = btns[0], last = btns[btns.length - 1];
       if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
       else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
@@ -1472,13 +1538,15 @@
 
     // Affiche une erreur inline dans le panneau (sans le fermer)
     showApplyError(msg) {
-      if (!this.menu) return;
-      let errEl = this.menu.querySelector('.corrector-apply-error');
+      const refs = this.getMenuRefs();
+      if (!refs) return;
+      let errEl = refs.applyError;
       if (!errEl) {
         errEl = document.createElement('div');
         errEl.className = 'corrector-apply-error';
-        const actions = this.menu.querySelector('.corrector-actions');
+        const actions = refs.actions;
         actions.parentNode.insertBefore(errEl, actions);
+        refs.applyError = errEl;
       }
       errEl.textContent = '\u26A0\uFE0F ' + msg;
     },
@@ -1537,6 +1605,7 @@
         if (typeof this.menu._dragCleanup === 'function') this.menu._dragCleanup();
         this.menu.remove();
         this.menu = null;
+        this.menuRefs = null;
         if (this.previousFocus && typeof this.previousFocus.focus === 'function') this.previousFocus.focus();
         this.previousFocus = null;
         this.selectedText = '';
