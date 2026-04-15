@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.2.1.1
+// @version        4.2.2
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -17,8 +17,20 @@
   'use strict';
 
   const STORAGE_KEY = '__corrector_v4_pos';
-  const DEBUG = true; // ← mettre false pour désactiver les logs
-  const dbg = (...a) => DEBUG && console.log('[Correcteur DEBUG]', ...a);
+  const DEBUG = true;
+  const _logs = [];
+  const dbg = (...a) => {
+    if (!DEBUG) return;
+    const line = a.map(x => (typeof x === 'object' ? JSON.stringify(x) : String(x))).join(' ');
+    _logs.push(new Date().toISOString().slice(11, 23) + ' ' + line);
+  };
+  const downloadLogs = () => {
+    const blob = new Blob([_logs.join('\n')], { type: 'text/plain' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = 'correcteur-debug.txt'; a.click();
+    URL.revokeObjectURL(url);
+  };
 
   const TextCorrector = {
     selectedText:   '',
@@ -505,10 +517,13 @@
             this.closeMenu();
             dbg('5) après closeMenu(), activeElement:', document.activeElement?.tagName, document.activeElement?.className);
             dbg('5) selection finale, rangeCount:', window.getSelection()?.rangeCount);
-            // Log keydown pendant 5s pour voir si les frappes arrivent bien
+            // Log keydown pendant 5s puis télécharge le fichier de debug
             const _dbgKd = (e) => dbg('KEYDOWN reçu:', e.key, '| activeElement:', document.activeElement?.tagName, document.activeElement?.className);
             document.addEventListener('keydown', _dbgKd);
-            setTimeout(() => document.removeEventListener('keydown', _dbgKd), 5000);
+            setTimeout(() => {
+              document.removeEventListener('keydown', _dbgKd);
+              downloadLogs();
+            }, 5000);
             this.showConfirmation(false);
             return;
           }
