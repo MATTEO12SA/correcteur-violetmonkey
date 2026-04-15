@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.2.7
+// @version        4.2.8
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -568,50 +568,88 @@
             this.showApplyError('Le texte a changé depuis la sélection. Resélectionnez.');
             return;
           }
-          editableEl.focus();
-          snap('B_focus_done', editableEl);
           watchMutations(editableEl, 8000);
           watchKeys(editableEl, 8000);
 
-          // ── Stratégie : selectAll → paste ───────────────────────────────────
-          // Draft.js utilise son SelectionState INTERNE pour le paste (pas window.getSelection).
-          // addRange() ne suffit pas : Draft.js override la sélection DOM via son onFocus.
-          // execCommand('selectAll') met à jour à la fois le DOM ET le SelectionState de Draft.js
-          // via le selectionchange qu'il émet, que Draft.js traite de façon native.
-          // Étape 1 : laisser Draft.js finir son cycle onFocus (~30 ms)
+          const finalize = () => {
+            this.lastApply = { type: 'contenteditable' };
+            editableEl.focus();
+            this.closeMenu();
+            snap('E_apres_closeMenu', editableEl);
+            this.showConfirmation(false);
+          };
+
+          const doPaste = () => {
+            editableEl.focus();
+            snap('B2_avant_paste', editableEl);
+            try {
+              const dt = new DataTransfer();
+              dt.setData('text/plain', corrected);
+              const pasteEvt = new ClipboardEvent('paste', {
+                bubbles: true, cancelable: true, clipboardData: dt,
+              });
+              const handled = !editableEl.dispatchEvent(pasteEvt);
+              snap('C_paste_dispatched_handled=' + handled, editableEl);
+              if (!handled) {
+                const ok = document.execCommand('insertText', false, corrected);
+                snap('D_execCommand_ok=' + ok, editableEl);
+              }
+            } catch (err) { dbg('paste error: ' + err.message); }
+            finalize();
+          };
+
+          // ── Stratégie A : fiber React → EditorState.forceSelection ──────────
+          // Draft.js ignore window.getSelection() pour le paste : il utilise son
+          // SelectionState interne. La seule façon fiable est de forcer ce state
+          // via l'onChange du composant React parent, sans passer par le DOM.
+          let usedDraftFiber = false;
+          try {
+            const rKey = Object.keys(editableEl).find(k =>
+              k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
+            );
+            if (rKey) {
+              let fiber = editableEl[rKey];
+              while (fiber) {
+                const p = fiber.memoizedProps;
+                if (p && typeof p.onChange === 'function' && p.editorState &&
+                    typeof p.editorState.getSelection === 'function' &&
+                    typeof p.editorState.getCurrentContent === 'function') {
+
+                  const { editorState, onChange } = p;
+                  const cs = editorState.getCurrentContent();
+                  const sel = editorState.getSelection();
+                  const allSelected = sel.merge({
+                    anchorKey:   cs.getFirstBlock().getKey(),
+                    anchorOffset: 0,
+                    focusKey:    cs.getLastBlock().getKey(),
+                    focusOffset: cs.getLastBlock().getLength(),
+                    hasFocus:    true,
+                    isBackward:  false,
+                  });
+                  const ES = editorState.constructor;
+                  onChange(ES.forceSelection(editorState, allSelected));
+                  snap('B_draft_forceSelection', editableEl);
+                  usedDraftFiber = true;
+                  break;
+                }
+                fiber = fiber.return;
+              }
+            }
+          } catch (e) { dbg('fiber error: ' + e.message); }
+
+          // Après re-render React (~50 ms), paste
+          if (usedDraftFiber) {
+            setTimeout(doPaste, 50);
+            return;
+          }
+
+          // ── Stratégie B : fallback selectAll + paste ─────────────────────────
+          editableEl.focus();
+          snap('B_focus_done', editableEl);
           setTimeout(() => {
             document.execCommand('selectAll');
             snap('B2_apres_selectAll', editableEl);
-
-            // Étape 2 : laisser Draft.js traiter le selectionchange de selectAll (~20 ms)
-            setTimeout(() => {
-              snap('B3_avant_paste', editableEl);
-              let handled = false;
-              try {
-                const dt = new DataTransfer();
-                dt.setData('text/plain', corrected);
-                // Pas de text/html : Draft.js parserait le HTML et casserait le texte brut
-                const pasteEvt = new ClipboardEvent('paste', {
-                  bubbles: true, cancelable: true, clipboardData: dt,
-                });
-                handled = !editableEl.dispatchEvent(pasteEvt);
-                snap('C_paste_dispatched_handled=' + handled, editableEl);
-              } catch (err) {
-                dbg('paste dispatch error: ' + err.message);
-              }
-
-              // ── Fallback execCommand ─────────────────────────────────────────
-              if (!handled) {
-                const execOk = document.execCommand('insertText', false, corrected);
-                snap('D_execCommand_ok=' + execOk, editableEl);
-              }
-
-              this.lastApply = { type: 'contenteditable' };
-              editableEl.focus();
-              this.closeMenu();
-              snap('E_apres_closeMenu', editableEl);
-              this.showConfirmation(false);
-            }, 20);
+            setTimeout(doPaste, 20);
           }, 30);
           return;
         }
