@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.2.8
+// @version        4.2.9
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -579,69 +579,100 @@
             this.showConfirmation(false);
           };
 
-          const doPaste = () => {
-            editableEl.focus();
-            snap('B2_avant_paste', editableEl);
-            try {
-              const dt = new DataTransfer();
-              dt.setData('text/plain', corrected);
-              const pasteEvt = new ClipboardEvent('paste', {
-                bubbles: true, cancelable: true, clipboardData: dt,
-              });
-              const handled = !editableEl.dispatchEvent(pasteEvt);
-              snap('C_paste_dispatched_handled=' + handled, editableEl);
-              if (!handled) {
-                const ok = document.execCommand('insertText', false, corrected);
-                snap('D_execCommand_ok=' + ok, editableEl);
-              }
-            } catch (err) { dbg('paste error: ' + err.message); }
-            finalize();
-          };
-
-          // ── Stratégie A : fiber React → EditorState.forceSelection ──────────
-          // Draft.js ignore window.getSelection() pour le paste : il utilise son
-          // SelectionState interne. La seule façon fiable est de forcer ce state
-          // via l'onChange du composant React parent, sans passer par le DOM.
+          // ── Stratégie A : fiber React → remplacement direct du ContentState ──
+          // Twitch's handlePastedText ignore la sélection et fait toujours insertText
+          // (jamais replaceText). La seule solution fiable : trouver le EditorState
+          // via le fiber React et remplacer directement le ContentState.
+          // Object.getOwnPropertyNames() pour trouver les props non-énumérables.
           let usedDraftFiber = false;
           try {
-            const rKey = Object.keys(editableEl).find(k =>
+            const allKeys = Object.getOwnPropertyNames(editableEl);
+            const rKey = allKeys.find(k =>
               k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
             );
+            dbg('fiber: rKey=' + (rKey ? rKey.slice(0, 30) : 'null') +
+                ' totalKeys=' + allKeys.length);
+
             if (rKey) {
               let fiber = editableEl[rKey];
-              while (fiber) {
+              let depth = 0;
+              let draftProps = null;
+
+              while (fiber && depth < 100 && !draftProps) {
+                // ① memoizedProps (class component ou fonction recevant des props)
                 const p = fiber.memoizedProps;
                 if (p && typeof p.onChange === 'function' && p.editorState &&
                     typeof p.editorState.getSelection === 'function' &&
                     typeof p.editorState.getCurrentContent === 'function') {
-
-                  const { editorState, onChange } = p;
-                  const cs = editorState.getCurrentContent();
-                  const sel = editorState.getSelection();
-                  const allSelected = sel.merge({
-                    anchorKey:   cs.getFirstBlock().getKey(),
-                    anchorOffset: 0,
-                    focusKey:    cs.getLastBlock().getKey(),
-                    focusOffset: cs.getLastBlock().getLength(),
-                    hasFocus:    true,
-                    isBackward:  false,
-                  });
-                  const ES = editorState.constructor;
-                  onChange(ES.forceSelection(editorState, allSelected));
-                  snap('B_draft_forceSelection', editableEl);
-                  usedDraftFiber = true;
-                  break;
+                  dbg('fiber: props match at depth=' + depth);
+                  draftProps = { editorState: p.editorState, onChange: p.onChange };
                 }
-                fiber = fiber.return;
+
+                // ② memoizedState hooks (useState dans une fonction component)
+                if (!draftProps) {
+                  let hook = fiber.memoizedState;
+                  let hi = 0;
+                  while (hook && hi < 30) {
+                    const hs = hook.memoizedState;
+                    if (hs && typeof hs.getSelection === 'function' &&
+                        typeof hs.getCurrentContent === 'function') {
+                      const dispatch = hook.queue && hook.queue.dispatch;
+                      if (dispatch) {
+                        dbg('fiber: hook[' + hi + '] match at depth=' + depth);
+                        draftProps = { editorState: hs, onChange: dispatch };
+                      }
+                      break;
+                    }
+                    hook = hook.next;
+                    hi++;
+                  }
+                }
+
+                if (!draftProps) { fiber = fiber.return; depth++; }
+              }
+
+              dbg('fiber: found=' + !!draftProps + ' depth=' + depth);
+
+              if (draftProps) {
+                const { editorState, onChange } = draftProps;
+                const cs    = editorState.getCurrentContent();
+                const sel   = editorState.getSelection();
+                const CS    = cs.constructor;    // ContentState class
+                const ES    = editorState.constructor; // EditorState class
+
+                if (typeof CS.createFromText === 'function' &&
+                    typeof ES.createWithContent === 'function') {
+                  // Créer un ContentState avec uniquement le texte corrigé
+                  const newContent = CS.createFromText(corrected);
+                  const lastBlk    = newContent.getLastBlock();
+
+                  // Curseur à la fin du texte corrigé
+                  const newSel = sel.merge({
+                    anchorKey:    lastBlk.getKey(),
+                    anchorOffset: lastBlk.getLength(),
+                    focusKey:     lastBlk.getKey(),
+                    focusOffset:  lastBlk.getLength(),
+                    hasFocus:     true,
+                    isBackward:   false,
+                  });
+
+                  const newES = ES.forceSelection(ES.createWithContent(newContent), newSel);
+                  onChange(newES);
+                  snap('B_draft_content_replaced', editableEl);
+                  usedDraftFiber = true;
+
+                  setTimeout(() => {
+                    editableEl.focus();
+                    finalize();
+                  }, 30);
+                } else {
+                  dbg('fiber: CS.createFromText or ES.createWithContent missing');
+                }
               }
             }
-          } catch (e) { dbg('fiber error: ' + e.message); }
+          } catch (e) { dbg('fiber error: ' + e.message + ' | ' + (e.stack || '').slice(0, 120)); }
 
-          // Après re-render React (~50 ms), paste
-          if (usedDraftFiber) {
-            setTimeout(doPaste, 50);
-            return;
-          }
+          if (usedDraftFiber) return;
 
           // ── Stratégie B : fallback selectAll + paste ─────────────────────────
           editableEl.focus();
@@ -649,7 +680,24 @@
           setTimeout(() => {
             document.execCommand('selectAll');
             snap('B2_apres_selectAll', editableEl);
-            setTimeout(doPaste, 20);
+            setTimeout(() => {
+              editableEl.focus();
+              snap('B2_avant_paste', editableEl);
+              try {
+                const dt = new DataTransfer();
+                dt.setData('text/plain', corrected);
+                const pasteEvt = new ClipboardEvent('paste', {
+                  bubbles: true, cancelable: true, clipboardData: dt,
+                });
+                const handled = !editableEl.dispatchEvent(pasteEvt);
+                snap('C_paste_dispatched_handled=' + handled, editableEl);
+                if (!handled) {
+                  const ok = document.execCommand('insertText', false, corrected);
+                  snap('D_execCommand_ok=' + ok, editableEl);
+                }
+              } catch (err) { dbg('paste error: ' + err.message); }
+              finalize();
+            }, 20);
           }, 30);
           return;
         }
