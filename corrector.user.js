@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.2.4
+// @version        4.2.5
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -410,9 +410,9 @@
         '</div>',
         '<div class="corrector-actions">',
         '  <button class="corrector-apply-btn" disabled>Appliquer</button>',
+        DEBUG ? '  <button class="corrector-debug-btn">Logs</button>' : '',
         '  <button class="corrector-copy-btn" style="display:none">Copier</button>',
         '  <button class="corrector-cancel-btn">Fermer</button>',
-        DEBUG ? '  <button class="corrector-debug-btn" title="Télécharger les logs debug">\uD83D\uDC1E</button>' : '',
         '</div>',
       ].join('');
 
@@ -568,44 +568,42 @@
             this.showApplyError('Le texte a changé depuis la sélection. Resélectionnez.');
             return;
           }
+          editableEl.focus();
           if (sel) { sel.removeAllRanges(); sel.addRange(this.selectedRange); }
           snap('B_selection_restauree', editableEl);
-          // Lance la surveillance des mutations DOM dès maintenant
-          watchMutations(editableEl, 6000);
-          const execOk = document.execCommand('insertText', false, corrected);
-          snap('C_apres_execCommand_ok=' + execOk, editableEl);
-          if (execOk) {
-            this.lastApply = { type: 'contenteditable' };
-            editableEl.focus();
-            snap('D_apres_focus', editableEl);
-            this.closeMenu();
-            snap('E_apres_closeMenu', editableEl);
-            // Force Draft.js / React à re-synchroniser son SelectionState interne
-            setTimeout(() => {
-              if (document.activeElement === editableEl) {
-                editableEl.dispatchEvent(new Event('select', { bubbles: true }));
-                document.dispatchEvent(new Event('selectionchange'));
-                snap('F_apres_select_dispatch', editableEl);
-              }
-              // Surveille clavier + input + selectionchange pendant 6s puis télécharge
-              watchKeys(editableEl, 6000);
-            }, 0);
-            this.showConfirmation(false);
-            return;
+          watchMutations(editableEl, 8000);
+          watchKeys(editableEl, 8000);
+
+          // ── Stratégie 1 : paste simulé ──────────────────────────────────────
+          // Twitch/React ne met PAS à jour son état interne via execCommand.
+          // Le paste handler de l'éditeur, lui, met bien à jour l'état React.
+          // On crée un ClipboardEvent avec le texte corrigé dans le DataTransfer.
+          let handled = false;
+          try {
+            const dt = new DataTransfer();
+            dt.setData('text/plain', corrected);
+            dt.setData('text/html',  corrected);
+            const pasteEvt = new ClipboardEvent('paste', {
+              bubbles: true, cancelable: true, clipboardData: dt,
+            });
+            handled = !editableEl.dispatchEvent(pasteEvt); // false = preventDefault appelé = géré
+            snap('C_paste_dispatched_handled=' + handled, editableEl);
+          } catch (err) {
+            dbg('paste dispatch error: ' + err.message);
           }
-          // Fallback si execCommand échoue
-          snap('C_execCommand_echoue_fallback', editableEl);
-          this.selectedRange.deleteContents();
-          const tn = document.createTextNode(corrected);
-          this.selectedRange.insertNode(tn);
-          const nr = document.createRange();
-          nr.setStartAfter(tn); nr.collapse(true);
+
+          // ── Stratégie 2 : execCommand (fallback) ────────────────────────────
+          // Utilisé si le paste n'a pas été géré par l'éditeur.
+          // Met à jour le DOM mais PAS forcément l'état React (problème connu sur Twitch).
+          if (!handled) {
+            const execOk = document.execCommand('insertText', false, corrected);
+            snap('D_execCommand_ok=' + execOk, editableEl);
+          }
+
+          this.lastApply = { type: 'contenteditable' };
           editableEl.focus();
           this.closeMenu();
-          const s = window.getSelection();
-          if (s) { s.removeAllRanges(); s.addRange(nr); }
-          snap('G_fallback_final', editableEl);
-          watchKeys(editableEl, 6000);
+          snap('E_apres_closeMenu', editableEl);
           this.showConfirmation(false);
           return;
         }
