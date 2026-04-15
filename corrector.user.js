@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.1.1
+// @version        4.2.0
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
+// @noframes
 // @updateURL      https://raw.githubusercontent.com/MATTEO12SA/correcteur-violetmonkey/main/corrector.user.js
 // @downloadURL    https://raw.githubusercontent.com/MATTEO12SA/correcteur-violetmonkey/main/corrector.user.js
 // @grant          GM_xmlhttpRequest
@@ -15,22 +16,26 @@
 (function () {
   'use strict';
 
-  const STORAGE_KEY = '_corrector_pos';
+  const STORAGE_KEY = '__corrector_v4_pos';
 
   const TextCorrector = {
-    selectedText:  '',
-    selectedRange: null,
-    menu:          null,
-    pill:          null,
+    selectedText:   '',
+    selectedRange:  null,
+    savedInputSel:  null,   // { start, end } capturé au déclenchement pour input/textarea
+    menu:           null,
+    pill:           null,
     currentRequest: null,
-    styleEl:       null,
-    previousFocus: null,
+    styleEl:        null,
+    previousFocus:  null,
+    lastApply:      null,   // données pour le bouton Annuler
+    _selChangeTid:  null,
 
     // ─────────────────────────────────────────────
     // Init
     // ─────────────────────────────────────────────
     init() {
       document.addEventListener('mouseup',         (e) => this.handleMouseUp(e));
+      document.addEventListener('keyup',           (e) => this.handleKeyUp(e));
       document.addEventListener('selectionchange', ()  => this.handleSelectionChange());
       document.addEventListener('click',           (e) => this.handleOutsideClick(e));
       document.addEventListener('keydown',         (e) => this.handleKeyDown(e));
@@ -65,33 +70,47 @@
     handleMouseUp(e) {
       if (this.menu?.contains(e.target)) return;
       if (this.pill?.contains(e.target)) return;
-      setTimeout(() => {
-        const sel  = window.getSelection();
-        const text = sel ? sel.toString().trim() : '';
-        if (!text || text.length < 3) { this.hidePill(); return; }
-        const range = sel.getRangeAt(0);
-        const rect  = range.getBoundingClientRect();
-        if (!rect.width && !rect.height) { this.hidePill(); return; }
-        this.showPill(rect);
-      }, 10);
+      setTimeout(() => this._checkSelectionAndShowPill(), 10);
     },
 
+    // Affiche la bulle après sélection clavier (Shift+flèche, Shift+End, etc.)
+    handleKeyUp(e) {
+      if (!e.shiftKey) return;
+      setTimeout(() => this._checkSelectionAndShowPill(), 10);
+    },
+
+    _checkSelectionAndShowPill() {
+      const sel  = window.getSelection();
+      const text = sel ? sel.toString().trim() : '';
+      if (!text || text.length < 3) { this.hidePill(); return; }
+      if (sel.rangeCount === 0) { this.hidePill(); return; }
+      const range = sel.getRangeAt(0);
+      const rect  = range.getBoundingClientRect();
+      if (!rect.width && !rect.height) { this.hidePill(); return; }
+      this.showPill(rect);
+    },
+
+    // Debounce : selectionchange se déclenche à chaque frappe sur toute la page
     handleSelectionChange() {
-      const sel = window.getSelection();
-      if (!sel || !sel.toString().trim()) this.hidePill();
+      clearTimeout(this._selChangeTid);
+      this._selChangeTid = setTimeout(() => {
+        const sel = window.getSelection();
+        if (!sel || !sel.toString().trim()) this.hidePill();
+      }, 80);
     },
 
     showPill(rect) {
       this.hidePill();
       const pill = document.createElement('button');
       pill.className = 'corrector-pill';
-      pill.setAttribute('aria-label', 'Corriger le texte selectionne');
+      pill.setAttribute('aria-label', 'Corriger le texte sélectionné');
       pill.textContent = '\u270E Corriger';
 
+      // position:fixed → coordonnées viewport directes (getBoundingClientRect déjà relatives au viewport)
       const pW = 112, pH = 30, gap = 8;
-      let x = rect.left + rect.width / 2 - pW / 2 + window.scrollX;
-      let y = rect.top - pH - gap + window.scrollY;
-      if (rect.top - pH - gap < 0) y = rect.bottom + gap + window.scrollY;
+      let x = rect.left + rect.width / 2 - pW / 2;
+      let y = rect.top - pH - gap;
+      if (rect.top - pH - gap < 0) y = rect.bottom + gap;
       x = Math.max(8, Math.min(x, window.innerWidth - pW - 8));
 
       pill.style.left = x + 'px';
@@ -113,6 +132,16 @@
       this.selectedText  = text;
       this.previousFocus = document.activeElement;
       this.selectedRange = sel.rangeCount > 0 ? sel.getRangeAt(0).cloneRange() : null;
+
+      // Capture la position curseur input/textarea au moment du clic sur la bulle.
+      // Ne pas la relire dans applyCorrection : le curseur peut avoir bougé pendant la lecture du panneau.
+      const ae = document.activeElement;
+      if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA') &&
+          typeof ae.selectionStart === 'number') {
+        this.savedInputSel = { start: ae.selectionStart, end: ae.selectionEnd };
+      } else {
+        this.savedInputSel = null;
+      }
 
       const pillRect = this.pill ? this.pill.getBoundingClientRect() : null;
       const savedPos = this.loadPosition();
@@ -157,8 +186,7 @@
         ontimeout: () => {
           this.currentRequest = null;
           this.setLoadingState(false);
-          const el = this.menu && this.menu.querySelector('.corrector-correction-content');
-          if (el) el.textContent = 'Delai depasse. Reessayez.';
+          this.showCorrectionError('Délai dépassé.');
         },
       });
     },
@@ -172,9 +200,19 @@
       }
     },
 
-    showCorrectionError() {
+    showCorrectionError(msg) {
       const el = this.menu && this.menu.querySelector('.corrector-correction-content');
-      if (el) el.textContent = '\u26A0 Erreur : impossible de corriger.';
+      if (!el) return;
+      const label = msg || 'Erreur : impossible de corriger.';
+      el.innerHTML = '';
+      const msgSpan = document.createElement('span');
+      msgSpan.textContent = '\u26A0 ' + label + ' ';
+      const retryBtn = document.createElement('button');
+      retryBtn.className   = 'corrector-retry-btn';
+      retryBtn.textContent = 'Réessayer';
+      retryBtn.addEventListener('click', () => this.fetchCorrection(this.selectedText));
+      el.appendChild(msgSpan);
+      el.appendChild(retryBtn);
     },
 
     // ─────────────────────────────────────────────
@@ -207,7 +245,10 @@
       // Correction
       const corrEl = this.menu.querySelector('.corrector-correction-content');
       if (corrected === text) {
-        corrEl.innerHTML = '<span class="corrector-ok">\u2713 Aucune correction n\u00e9cessaire</span>';
+        const ok = document.createElement('span');
+        ok.className   = 'corrector-ok';
+        ok.textContent = '\u2713 Aucune correction nécessaire';
+        corrEl.replaceChildren(ok);
       } else {
         corrEl.replaceChildren(...this.buildSpans(text, valid, (m) => {
           const s = document.createElement('span');
@@ -232,6 +273,7 @@
       let cursor   = 0;
       const sorted = matches.slice().sort((a, b) => a.offset - b.offset);
       for (const m of sorted) {
+        if (m.offset < cursor) continue; // ignore les matches qui chevauchent le précédent
         if (m.offset > cursor) nodes.push(document.createTextNode(text.slice(cursor, m.offset)));
         nodes.push(makeSpan(m));
         cursor = m.offset + m.length;
@@ -243,9 +285,23 @@
     applyMatches(text, matches) {
       if (!matches.length) return text;
       let r = text;
-      for (const m of matches.slice().sort((a, b) => b.offset - a.offset))
+      let boundary = text.length; // frontière basse : ne pas toucher ce qui a déjà été remplacé
+      for (const m of matches.slice().sort((a, b) => b.offset - a.offset)) {
+        if (m.offset + m.length > boundary) continue; // chevauche un remplacement précédent
         r = r.slice(0, m.offset) + m.replacements[0].value + r.slice(m.offset + m.length);
+        boundary = m.offset;
+      }
       return r;
+    },
+
+    // Vérifie que la range sauvegardée pointe toujours vers le bon texte dans le DOM
+    isRangeValid() {
+      if (!this.selectedRange) return false;
+      const sc = this.selectedRange.startContainer;
+      const ec = this.selectedRange.endContainer;
+      if (!sc.isConnected || !ec.isConnected) return false;
+      if (this.selectedRange.toString() !== this.selectedText) return false;
+      return true;
     },
 
     // ─────────────────────────────────────────────
@@ -260,16 +316,16 @@
       menu.setAttribute('aria-labelledby', 'corrector-title');
 
       menu.innerHTML = [
-        '<div class="corrector-header" title="Maintenir pour deplacer">',
+        '<div class="corrector-header" title="Maintenir pour déplacer">',
         '  <span class="corrector-title" id="corrector-title">\u270E Correcteur</span>',
         '  <button class="corrector-close-btn" aria-label="Fermer">\u2715</button>',
         '</div>',
         '<div class="corrector-section">',
-        '  <div class="corrector-label">Texte selectionne</div>',
+        '  <div class="corrector-label">Texte sélectionné</div>',
         '  <div class="corrector-original-content"></div>',
         '</div>',
         '<div class="corrector-section">',
-        '  <div class="corrector-label">Correction suggeree</div>',
+        '  <div class="corrector-label">Correction suggérée</div>',
         '  <div class="corrector-correction-content" aria-live="polite" aria-atomic="true">',
         '    <span class="corrector-spinner" aria-hidden="true"></span>',
         '    <span>Correction en cours\u2026</span>',
@@ -295,10 +351,20 @@
         const txt = e.currentTarget.dataset.text;
         if (!txt) return;
         const btn = e.currentTarget;
-        navigator.clipboard.writeText(txt).then(() => {
-          btn.textContent = '\u2713 Copie';
+        const onCopied = () => {
+          btn.textContent = '\u2713 Copié';
           setTimeout(() => { btn.textContent = 'Copier'; }, 1500);
-        }).catch(() => {});
+        };
+        navigator.clipboard.writeText(txt).then(onCopied).catch(() => {
+          // Fallback si l'API Clipboard est refusée ou indisponible
+          try {
+            const ta = document.createElement('textarea');
+            ta.value = txt; ta.style.cssText = 'position:fixed;opacity:0';
+            document.body.appendChild(ta); ta.select();
+            document.execCommand('copy'); ta.remove();
+            onCopied();
+          } catch (_) {}
+        });
       });
       const close = () => this.closeMenu();
       menu.querySelector('.corrector-cancel-btn').addEventListener('click', close);
@@ -340,7 +406,7 @@
         this.savePosition(parseInt(menu.style.left), parseInt(menu.style.top));
       };
 
-      // Expose pour nettoyage si le menu est fermé en cours de drag
+      // Nettoyage si le menu est fermé pendant un drag (évite des listeners fantômes)
       menu._dragCleanup = () => {
         document.removeEventListener('mousemove', onMove);
         document.removeEventListener('mouseup',   onUp);
@@ -401,36 +467,44 @@
         // ── Cas 1 : <input> ou <textarea> ──────────
         const inputEl = parent && parent.closest('input, textarea');
         if (inputEl && typeof inputEl.selectionStart === 'number') {
-          inputEl.focus();
-          const start = inputEl.selectionStart;
-          const end   = inputEl.selectionEnd;
+          // Utilise la sélection capturée au déclenchement (pas la position courante qui a pu bouger)
+          const start = this.savedInputSel ? this.savedInputSel.start : inputEl.selectionStart;
+          const end   = this.savedInputSel ? this.savedInputSel.end   : inputEl.selectionEnd;
+          const originalValue = inputEl.value;
           inputEl.setRangeText(corrected, start, end, 'end');
           inputEl.dispatchEvent(new Event('input',  { bubbles: true }));
           inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+          this.lastApply = { type: 'input', el: inputEl, originalValue, start, end };
           this.closeMenu();
-          this.showConfirmation();
+          inputEl.focus();
+          this.showConfirmation(true);
           return;
         }
 
         // ── Cas 2 : contenteditable ─────────────────
         const editableEl = parent && parent.closest('[contenteditable="true"], [contenteditable=""]');
         if (editableEl) {
+          if (!this.isRangeValid()) {
+            this.showApplyError('Le texte a changé depuis la sélection. Resélectionnez.');
+            return;
+          }
           if (sel) { sel.removeAllRanges(); sel.addRange(this.selectedRange); }
-          // execCommand ici UNIQUEMENT car on est dans un contenteditable
+          // execCommand UNIQUEMENT ici : préserve le Ctrl+Z natif du navigateur
           if (document.execCommand('insertText', false, corrected)) {
-            // Sauvegarder le curseur AVANT closeMenu() : la suppression du bouton focusé
+            // Sauvegarde curseur AVANT closeMenu() : la suppression du bouton focusé
             // déplace le focus sur <body> et efface la sélection du contenteditable.
             const afterRange = sel && sel.rangeCount > 0 ? sel.getRangeAt(0).cloneRange() : null;
+            this.lastApply = { type: 'contenteditable' }; // Ctrl+Z natif suffit
             this.closeMenu();
             editableEl.focus();
             if (afterRange) {
               const s = window.getSelection();
               if (s) { s.removeAllRanges(); s.addRange(afterRange); }
             }
-            this.showConfirmation();
+            this.showConfirmation(false); // Ctrl+Z disponible → pas de bouton Annuler
             return;
           }
-          // Fallback contenteditable si execCommand échoue
+          // Fallback si execCommand échoue
           this.selectedRange.deleteContents();
           const tn = document.createTextNode(corrected);
           this.selectedRange.insertNode(tn);
@@ -440,28 +514,62 @@
           editableEl.focus();
           const s = window.getSelection();
           if (s) { s.removeAllRanges(); s.addRange(nr); }
-          this.showConfirmation();
+          this.showConfirmation(false);
           return;
         }
 
         // ── Cas 3 : DOM statique (span, p, div…) ───
+        if (!this.isRangeValid()) {
+          this.showApplyError('Le texte a changé depuis la sélection. Resélectionnez.');
+          return;
+        }
+        const originalText = this.selectedRange.toString();
         this.selectedRange.deleteContents();
         const textNode = document.createTextNode(corrected);
         this.selectedRange.insertNode(textNode);
 
-        // Curseur après le texte inséré → évite les sauts de ligne
         const newRange = document.createRange();
         newRange.setStartAfter(textNode);
         newRange.collapse(true);
         if (sel) { sel.removeAllRanges(); sel.addRange(newRange); }
 
+        this.lastApply = {
+          type: 'dom', textNode, originalText,
+          parentNode: textNode.parentNode, nextSibling: textNode.nextSibling,
+        };
         this.closeMenu();
-        this.showConfirmation();
+        this.showConfirmation(true);
 
       } catch (err) {
         console.error('[Correcteur]', err);
         this.showApplyError('Impossible de remplacer sur ce site. Utilisez "Copier".');
       }
+    },
+
+    undoLastApply() {
+      if (!this.lastApply) return;
+      const { type } = this.lastApply;
+      try {
+        if (type === 'input') {
+          const { el, originalValue, start, end } = this.lastApply;
+          el.value = originalValue;
+          el.setSelectionRange(start, end);
+          el.dispatchEvent(new Event('input',  { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          el.focus();
+        } else if (type === 'dom') {
+          const { textNode, originalText, parentNode, nextSibling } = this.lastApply;
+          const original = document.createTextNode(originalText);
+          if (textNode.parentNode) {
+            textNode.parentNode.replaceChild(original, textNode);
+          } else if (parentNode) {
+            parentNode.insertBefore(original, nextSibling || null);
+          }
+        }
+      } catch (err) {
+        console.error('[Correcteur] Undo échoué :', err);
+      }
+      this.lastApply = null;
     },
 
     // Affiche une erreur inline dans le panneau (sans le fermer)
@@ -477,16 +585,38 @@
       errEl.textContent = '\u26A0\uFE0F ' + msg;
     },
 
-    showConfirmation() {
+    showConfirmation(withUndo) {
       const toast = document.createElement('div');
       toast.className = 'corrector-toast';
       toast.setAttribute('role', 'status');
-      toast.textContent = '\u2713 Correction appliquee';
+
+      const msgSpan = document.createElement('span');
+      msgSpan.textContent = '\u2713 Correction appliquée';
+      toast.appendChild(msgSpan);
+
+      if (withUndo) {
+        const undoBtn = document.createElement('button');
+        undoBtn.className   = 'corrector-toast-undo';
+        undoBtn.textContent = 'Annuler';
+        undoBtn.addEventListener('click', () => { this.undoLastApply(); toast.remove(); });
+        toast.appendChild(undoBtn);
+      }
+
       document.body.appendChild(toast);
-      setTimeout(() => {
+
+      let fadeTimer = setTimeout(() => {
         toast.classList.add('corrector-toast-fade');
         setTimeout(() => toast.remove(), 400);
-      }, 1800);
+      }, 3000);
+
+      // Pause le fade si la souris survole (pour laisser le temps de cliquer "Annuler")
+      toast.addEventListener('mouseenter', () => clearTimeout(fadeTimer));
+      toast.addEventListener('mouseleave', () => {
+        fadeTimer = setTimeout(() => {
+          toast.classList.add('corrector-toast-fade');
+          setTimeout(() => toast.remove(), 400);
+        }, 1200);
+      });
     },
 
     // ─────────────────────────────────────────────
@@ -508,8 +638,9 @@
         this.menu.remove();
         this.menu = null;
         if (this.previousFocus && typeof this.previousFocus.focus === 'function') this.previousFocus.focus();
-        this.previousFocus  = null;
-        this.selectedRange  = null;
+        this.previousFocus = null;
+        this.selectedRange = null;
+        this.savedInputSel = null;
       }
     },
 
@@ -525,7 +656,7 @@
 
         /* ── Bulle ── */
         .corrector-pill {
-          position: absolute;
+          position: fixed;
           z-index: 2147483647;
           background: #18181b;
           color: #fff;
@@ -667,6 +798,15 @@
         }
         .corrector-ok { color: #15803d; font-weight: 600; }
 
+        /* Bouton réessayer dans la zone correction */
+        .corrector-retry-btn {
+          cursor: pointer; padding: 2px 10px; border: none;
+          background: #2563eb; color: #fff; border-radius: 4px;
+          font-size: 12px; font-weight: 600; vertical-align: middle;
+          transition: background .15s;
+        }
+        .corrector-retry-btn:hover { background: #1d4ed8; }
+
         /* Actions */
         .corrector-actions {
           display: flex; gap: 8px;
@@ -732,15 +872,27 @@
         .corrector-toast {
           position: fixed; bottom: 24px; right: 24px;
           background: #16a34a; color: #fff;
-          padding: 10px 20px; border-radius: 8px;
+          padding: 10px 16px; border-radius: 8px;
           font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
           font-size: 13px; font-weight: 600;
           z-index: 2147483647;
           box-shadow: 0 4px 14px rgba(0,0,0,.2);
+          display: flex; align-items: center; gap: 10px;
           transition: opacity .4s, transform .4s;
           animation: corrector-pop .2s ease-out;
         }
         .corrector-toast-fade { opacity: 0; transform: translateY(8px); }
+        .corrector-toast-undo {
+          background: rgba(255,255,255,.25); border: none; color: #fff;
+          padding: 2px 10px; border-radius: 4px; cursor: pointer;
+          font-size: 12px; font-weight: 700;
+          transition: background .15s;
+        }
+        .corrector-toast-undo:hover { background: rgba(255,255,255,.4); }
+
+        @media (prefers-color-scheme: dark) {
+          .corrector-toast { background: #15803d; }
+        }
       `;
       (document.head || document.documentElement).appendChild(style);
     }
