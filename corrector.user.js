@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.6.1
+// @version        4.6.2
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -25,6 +25,21 @@
   const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url', 'tel', 'email', 'password']);
   const CORRECTION_MODES = new Set(['chat-lite', 'balanced', 'strict']);
   const DEFAULT_CORRECTION_MODE = 'balanced';
+  const HOST_CHAT_REGEX = /(?:^|\.)(?:twitch|kick|discord|slack|telegram|messenger|teams|irccloud|chat)\./i;
+  const WORD_TOKEN_REGEX = /[\p{L}\p{N}]+(?:[’'-][\p{L}\p{N}]+)*/gu;
+  const LETTER_REGEX = /\p{L}/gu;
+  const URL_REGEX = /\b(?:https?:\/\/|www\.)[^\s<>"'`]+/gi;
+  const EMAIL_REGEX = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
+  const MENTION_REGEX = /@[A-Za-z0-9_]{2,}/g;
+  const HASHTAG_REGEX = /#[\p{L}\p{N}_-]{2,}/gu;
+  const EMOJI_REGEX = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu;
+  const SYMBOL_REGEX = /[^\s\p{L}\p{N}]/gu;
+  const INLINE_CODE_REGEX = /`[^`\n]+`/g;
+  const CODEISH_BRACKET_REGEX = /[`{}[\]<>]/;
+  const CODEISH_COMMAND_REGEX = /(?:^|\s)(?:npm|pnpm|yarn|git|cd|ls|rm|cp|mv|sudo|npx)\b/i;
+  const SENTENCE_END_REGEX = /[.!?…]\s*$/;
+  const TITLE_CASE_REGEX = /^\p{Lu}[\p{Ll}]+$/u;
+  const NON_LETTER_REGEX = /[^\p{L}]/gu;
 
   const readStoredFlag = (key) => {
     try {
@@ -93,6 +108,17 @@
     const leading = (value.match(/^\s*/) || [''])[0];
     const trailing = (value.match(/\s*$/) || [''])[0];
     return { leading, trailing };
+  };
+
+  const cloneRegex = (regex) => new RegExp(regex.source, regex.flags);
+
+  const countPatternMatches = (text, regex) => {
+    const source = text || '';
+    if (!source) return 0;
+    const pattern = cloneRegex(regex);
+    let count = 0;
+    while (pattern.exec(source)) count += 1;
+    return count;
   };
 
   const dbg = (...a) => {
@@ -534,39 +560,48 @@
     // ─────────────────────────────────────────────
     createCorrectionContext(text) {
       const host = (window.location.hostname || '').toLowerCase();
-      const profile = this.classifySelectionText(text, host);
+      const analysis = this.analyzeSelectionText(text, host);
       return {
         host,
         mode: correctionMode,
-        profile,
-        protectedRanges: this.collectProtectedRanges(text),
+        profile: analysis.profile,
+        protectedRanges: analysis.protectedRanges,
       };
     },
 
-    classifySelectionText(text, host) {
+    analyzeSelectionText(text, host) {
       const source = text || '';
-      const words = source.match(/[\p{L}\p{N}]+(?:[’'-][\p{L}\p{N}]+)*/gu) || [];
-      const letters = source.match(/\p{L}/gu) || [];
-      const urls = source.match(/\b(?:https?:\/\/|www\.)[^\s<>"'`]+/gi) || [];
-      const mentions = source.match(/(^|[\s(])@[A-Za-z0-9_]{2,}/g) || [];
-      const hashtags = source.match(/(^|[\s(])#[\p{L}\p{N}_-]{2,}/gu) || [];
-      const emojis = source.match(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu) || [];
-      const symbols = source.match(/[^\s\p{L}\p{N}]/gu) || [];
-      const hostLooksChat = /(?:^|\.)(?:twitch|kick|discord|slack|telegram|messenger|teams|irccloud|chat)\./i.test(host);
+      const urlRanges = this.collectPatternRanges(source, URL_REGEX, 'url');
+      const emailRanges = this.collectPatternRanges(source, EMAIL_REGEX, 'email');
+      const mentionRanges = this.collectPatternRanges(source, MENTION_REGEX, 'mention');
+      const hashtagRanges = this.collectPatternRanges(source, HASHTAG_REGEX, 'hashtag');
+      const codeRanges = this.collectPatternRanges(source, INLINE_CODE_REGEX, 'code');
+      const hostLooksChat = HOST_CHAT_REGEX.test(host);
       const shortText = source.trim().length <= 140;
-      const codeish = /[`{}[\]<>]/.test(source) || /(?:^|\s)(?:npm|pnpm|yarn|git|cd|ls|rm|cp|mv|sudo|npx)\b/i.test(source);
-      const symbolRatio = source.length ? symbols.length / source.length : 0;
+      const codeish = CODEISH_BRACKET_REGEX.test(source) || CODEISH_COMMAND_REGEX.test(source);
+      const symbolCount = countPatternMatches(source, SYMBOL_REGEX);
+      const emojiCount = countPatternMatches(source, EMOJI_REGEX);
+      const symbolRatio = source.length ? symbolCount / source.length : 0;
 
       return {
-        wordCount: words.length,
-        letterCount: letters.length,
-        urlCount: urls.length,
-        mentionCount: mentions.length,
-        hashtagCount: hashtags.length,
-        emojiCount: emojis.length,
-        symbolRatio,
-        codeish,
-        chatLike: hostLooksChat || mentions.length > 0 || hashtags.length > 0 || emojis.length > 0 || (shortText && symbolRatio > 0.08),
+        profile: {
+          wordCount: countPatternMatches(source, WORD_TOKEN_REGEX),
+          letterCount: countPatternMatches(source, LETTER_REGEX),
+          urlCount: urlRanges.length,
+          mentionCount: mentionRanges.length,
+          hashtagCount: hashtagRanges.length,
+          emojiCount,
+          symbolRatio,
+          codeish,
+          chatLike: hostLooksChat || mentionRanges.length > 0 || hashtagRanges.length > 0 || emojiCount > 0 || (shortText && symbolRatio > 0.08),
+        },
+        protectedRanges: this.mergeProtectedRanges([
+          ...urlRanges,
+          ...emailRanges,
+          ...mentionRanges,
+          ...hashtagRanges,
+          ...codeRanges,
+        ]),
       };
     },
 
@@ -575,17 +610,10 @@
       return [context.host, context.mode, flavor, text].join('||');
     },
 
-    collectProtectedRanges(text) {
-      const ranges = [
-        ...this.collectPatternRanges(text, /\b(?:https?:\/\/|www\.)[^\s<>"'`]+/gi, 'url'),
-        ...this.collectPatternRanges(text, /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, 'email'),
-        ...this.collectPatternRanges(text, /@[A-Za-z0-9_]{2,}/g, 'mention'),
-        ...this.collectPatternRanges(text, /#[\p{L}\p{N}_-]{2,}/gu, 'hashtag'),
-        ...this.collectPatternRanges(text, /`[^`\n]+`/g, 'code'),
-      ].sort((a, b) => a.start - b.start || a.end - b.end);
-
+    mergeProtectedRanges(ranges) {
+      const sortedRanges = ranges.slice().sort((a, b) => a.start - b.start || a.end - b.end);
       const merged = [];
-      for (const range of ranges) {
+      for (const range of sortedRanges) {
         const last = merged[merged.length - 1];
         if (last && range.start <= last.end) {
           last.end = Math.max(last.end, range.end);
@@ -599,8 +627,7 @@
     collectPatternRanges(text, regex, kind) {
       const source = text || '';
       if (!source) return [];
-      const flags = regex.flags.includes('g') ? regex.flags : regex.flags + 'g';
-      const pattern = new RegExp(regex.source, flags);
+      const pattern = cloneRegex(regex);
       const ranges = [];
       let match;
       while ((match = pattern.exec(source))) {
@@ -615,11 +642,15 @@
     },
 
     rangesOverlap(start, end, ranges) {
-      return ranges.some((range) => start < range.end && end > range.start);
+      for (const range of ranges) {
+        if (range.start >= end) break;
+        if (start < range.end && end > range.start) return true;
+      }
+      return false;
     },
 
     countWords(text) {
-      return (text.match(/[\p{L}\p{N}]+(?:[’'-][\p{L}\p{N}]+)*/gu) || []).length;
+      return countPatternMatches(text, WORD_TOKEN_REGEX);
     },
 
     getMatchIssueType(match) {
@@ -638,11 +669,16 @@
       const offset = match.offset;
       const length = match.length;
       const original = text.slice(offset, offset + length);
+      const originalLetters = original.replace(NON_LETTER_REGEX, '');
       return {
         match,
         offset,
         length,
         original,
+        originalLetters,
+        isOriginalAllCaps: originalLetters.length > 1 && originalLetters === originalLetters.toUpperCase(),
+        isOriginalTitleCase: TITLE_CASE_REGEX.test(originalLetters),
+        isOriginalLowerCase: originalLetters === originalLetters.toLowerCase(),
         issueType: this.getMatchIssueType(match),
         categoryId: this.getMatchCategoryId(match),
         ruleId: this.getMatchRuleId(match),
@@ -652,7 +688,7 @@
 
     isSentenceStart(text, offset) {
       const before = (text || '').slice(0, offset).trimEnd();
-      return !before || /[.!?…]\s*$/.test(before);
+      return !before || SENTENCE_END_REGEX.test(before);
     },
 
     upperCaseFirstLetter(text) {
@@ -663,19 +699,26 @@
       return text.replace(/\p{L}/u, (letter) => letter.toLowerCase());
     },
 
-    normalizeReplacementCasing(original, replacement, text, offset) {
-      const originalLetters = (original || '').replace(/[^\p{L}]/gu, '');
+    normalizeReplacementCasing(matchInfo, replacement, text) {
+      const {
+        originalLetters,
+        isOriginalAllCaps,
+        isOriginalTitleCase,
+        isOriginalLowerCase,
+        offset,
+      } = matchInfo;
       if (!originalLetters) return replacement;
-      if (originalLetters.length > 1 && originalLetters === originalLetters.toUpperCase()) {
+      if (isOriginalAllCaps) {
         return replacement.toUpperCase();
       }
-      if (/^\p{Lu}[\p{Ll}]+$/u.test(originalLetters)) {
+      if (isOriginalTitleCase) {
         return this.upperCaseFirstLetter(replacement);
       }
+      const replacementLetters = (replacement || '').replace(NON_LETTER_REGEX, '');
       if (
-        originalLetters === originalLetters.toLowerCase() &&
+        isOriginalLowerCase &&
         !this.isSentenceStart(text, offset) &&
-        /^\p{Lu}[\p{Ll}]+$/u.test((replacement || '').replace(/[^\p{L}]/gu, ''))
+        TITLE_CASE_REGEX.test(replacementLetters)
       ) {
         return this.lowerCaseFirstLetter(replacement);
       }
@@ -711,19 +754,21 @@
     },
 
     pickReplacement(matchInfo, text, context) {
-      const { match, original, offset } = matchInfo;
+      const { match } = matchInfo;
       const candidates = [];
+      const seenCandidates = new Set();
       for (const replacement of (match.replacements || []).slice(0, 5)) {
         const value = replacement && typeof replacement.value === 'string'
           ? replacement.value.replace(/\u00A0/g, ' ')
           : '';
-        if (!value || candidates.includes(value)) continue;
+        if (!value || seenCandidates.has(value)) continue;
+        seenCandidates.add(value);
         candidates.push(value);
       }
 
       let best = null;
       for (const candidate of candidates) {
-        const normalized = this.normalizeReplacementCasing(original, candidate, text, offset);
+        const normalized = this.normalizeReplacementCasing(matchInfo, candidate, text);
         const replacementWordCount = this.countWords(normalized);
         if (!this.isReplacementSafe(matchInfo, normalized, replacementWordCount, context)) continue;
         const score = this.scoreReplacementCandidate(matchInfo, normalized, replacementWordCount, context);
