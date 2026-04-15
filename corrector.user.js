@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.6.2
+// @version        4.7.0
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -40,6 +40,127 @@
   const SENTENCE_END_REGEX = /[.!?…]\s*$/;
   const TITLE_CASE_REGEX = /^\p{Lu}[\p{Ll}]+$/u;
   const NON_LETTER_REGEX = /[^\p{L}]/gu;
+  const FRENCH_HINT_CHAR_REGEX = /[àâçéèêëîïôùûüœæ]/i;
+  const FRENCH_HINT_WORD_REGEX = /\b(?:bonjour|salut|merci|je|j['’]?|tu|il|elle|on|nous|vous|ils|elles|que|qui|quoi|est|suis|es|pas|pour|avec|dans|sur|une|des|les|mon|ton|son|bien|tres|très|ça|ca|vais|fait|faire|avoir)\b/giu;
+  const FRENCH_CHAT_PATTERN_REGEX = /\b(?:cava|ca va|sa va|j ai|c est|d accord|comme meme|a l enver[st]|a cote|peut etre)\b/iu;
+  const FRENCH_LOCAL_RULES = [
+    {
+      id: 'LOCAL_FR_CAVA',
+      pattern: /\bcava\b/giu,
+      replacement: 'ça va',
+      message: 'Expression française courante',
+      priorityBoost: 28,
+    },
+    {
+      id: 'LOCAL_FR_CA_VA',
+      pattern: /\b(?:ca|sa)\s+va\b/giu,
+      replacement: 'ça va',
+      message: 'Expression française courante',
+      priorityBoost: 28,
+    },
+    {
+      id: 'LOCAL_FR_COMME_MEME',
+      pattern: /\bcomme\s+meme\b/giu,
+      replacement: 'quand même',
+      message: 'Expression française courante',
+      priorityBoost: 28,
+    },
+    {
+      id: 'LOCAL_FR_A_LENVERS',
+      pattern: /\b(?:a|à)\s+l(?:['’]|\s+)enver[st]\b/giu,
+      replacement: 'à l\'envers',
+      message: 'Expression française courante',
+      priorityBoost: 34,
+    },
+    {
+      id: 'LOCAL_FR_A_COTE',
+      pattern: /\b(?:a|à)\s+cote\b/giu,
+      replacement: 'à côté',
+      message: 'Accent français courant',
+      priorityBoost: 22,
+    },
+    {
+      id: 'LOCAL_FR_A_TRAVERS',
+      pattern: /\b(?:a|à)\s+travers\b/giu,
+      replacement: 'à travers',
+      message: 'Accent français courant',
+      priorityBoost: 22,
+    },
+    {
+      id: 'LOCAL_FR_PEUT_ETRE',
+      pattern: /\bpeut(?:etre|\s+etre)\b/giu,
+      replacement: 'peut-être',
+      message: 'Expression française courante',
+      priorityBoost: 24,
+    },
+    {
+      id: 'LOCAL_FR_C_EST',
+      pattern: /\bc\s+est\b/giu,
+      replacement: 'c\'est',
+      message: 'Apostrophe française courante',
+      priorityBoost: 16,
+    },
+    {
+      id: 'LOCAL_FR_SE_NEST',
+      pattern: /\bse\s+n['’]?est\b/giu,
+      replacement: 'ce n\'est',
+      message: 'Expression française courante',
+      priorityBoost: 30,
+    },
+    {
+      id: 'LOCAL_FR_PARMIS',
+      pattern: /\bparmis\b/giu,
+      replacement: 'parmi',
+      message: 'Orthographe française courante',
+      priorityBoost: 20,
+    },
+    {
+      id: 'LOCAL_FR_BIZZARE',
+      pattern: /\bbizzare\b/giu,
+      replacement: 'bizarre',
+      message: 'Orthographe française courante',
+      priorityBoost: 20,
+    },
+    {
+      id: 'LOCAL_FR_MALGRES',
+      pattern: /\bmalgr(?:es|ès)\b/giu,
+      replacement: 'malgré',
+      message: 'Accent français courant',
+      priorityBoost: 20,
+    },
+    {
+      id: 'LOCAL_FR_QU_APOSTROPHE',
+      pattern: /\b([Qq]u|[Jj]usqu|[Ll]orsqu|[Pp]uisqu|[Pp]resqu|[Qq]uelqu)\s+([aeiouyhàâäæéèêëîïôöœùûü][\p{L}\p{M}'’-]*)/gu,
+      replacement: (match) => `${match[1]}'${match[2]}`,
+      message: 'Apostrophe française courante',
+      chatOnly: true,
+      priorityBoost: 6,
+    },
+    {
+      id: 'LOCAL_FR_APOSTROPHE_COMMON',
+      pattern: /\b([JjNnDdLlMm])\s+([aeiouyhàâäæéèêëîïôöœùûü][\p{L}\p{M}'’-]*)/gu,
+      replacement: (match) => `${match[1]}'${match[2]}`,
+      message: 'Apostrophe française courante',
+      chatOnly: true,
+      priorityBoost: 4,
+    },
+    {
+      id: 'LOCAL_FR_S_IL',
+      pattern: /\b([Ss])\s+(il|ils)\b/giu,
+      replacement: (match) => `${match[1]}'${match[2]}`,
+      message: 'Apostrophe française courante',
+      chatOnly: true,
+      priorityBoost: 5,
+    },
+    {
+      id: 'LOCAL_FR_T_APOSTROPHE',
+      pattern: /\b([Tt])\s+(es|as|avais|étais|aimes|adore(?:s)?|habite(?:s)?)\b/giu,
+      replacement: (match) => `${match[1]}'${match[2]}`,
+      message: 'Apostrophe française courante',
+      chatOnly: true,
+      priorityBoost: 5,
+    },
+  ];
 
   const readStoredFlag = (key) => {
     try {
@@ -566,6 +687,7 @@
         mode: correctionMode,
         profile: analysis.profile,
         protectedRanges: analysis.protectedRanges,
+        languageHint: analysis.languageHint,
       };
     },
 
@@ -582,6 +704,22 @@
       const symbolCount = countPatternMatches(source, SYMBOL_REGEX);
       const emojiCount = countPatternMatches(source, EMOJI_REGEX);
       const symbolRatio = source.length ? symbolCount / source.length : 0;
+      const frenchHintWordCount = countPatternMatches(source, FRENCH_HINT_WORD_REGEX);
+      const frenchPatternHit = FRENCH_CHAT_PATTERN_REGEX.test(source);
+      const browserFrench = (() => {
+        try {
+          const langs = Array.isArray(navigator.languages) && navigator.languages.length
+            ? navigator.languages
+            : [navigator.language];
+          return langs.some((lang) => /^fr(?:[-_]|$)/i.test(lang || ''));
+        } catch (_) {
+          return false;
+        }
+      })();
+      const frenchLikely = FRENCH_HINT_CHAR_REGEX.test(source)
+        || frenchHintWordCount >= 2
+        || frenchPatternHit
+        || (browserFrench && (frenchHintWordCount >= 1 || (hostLooksChat && shortText)));
 
       return {
         profile: {
@@ -594,6 +732,7 @@
           symbolRatio,
           codeish,
           chatLike: hostLooksChat || mentionRanges.length > 0 || hashtagRanges.length > 0 || emojiCount > 0 || (shortText && symbolRatio > 0.08),
+          frenchLikely,
         },
         protectedRanges: this.mergeProtectedRanges([
           ...urlRanges,
@@ -602,12 +741,13 @@
           ...hashtagRanges,
           ...codeRanges,
         ]),
+        languageHint: frenchLikely ? 'fr' : 'auto',
       };
     },
 
     buildCorrectionCacheKey(text, context) {
       const flavor = context.profile.chatLike ? 'chat' : 'prose';
-      return [context.host, context.mode, flavor, text].join('||');
+      return [context.host, context.mode, context.languageHint, flavor, text].join('||');
     },
 
     mergeProtectedRanges(ranges) {
@@ -653,6 +793,47 @@
       return countPatternMatches(text, WORD_TOKEN_REGEX);
     },
 
+    collectLocalFrenchMatches(text, context) {
+      const source = text || '';
+      if (!source) return [];
+      if (!context?.profile?.frenchLikely && !FRENCH_CHAT_PATTERN_REGEX.test(source)) return [];
+
+      const matches = [];
+      const seen = new Set();
+      for (const rule of FRENCH_LOCAL_RULES) {
+        if (rule.chatOnly && !context.profile.chatLike) continue;
+        const pattern = cloneRegex(rule.pattern);
+        let match;
+        while ((match = pattern.exec(source))) {
+          const value = match[0];
+          if (!value) {
+            pattern.lastIndex += 1;
+            continue;
+          }
+          const replacementValue = typeof rule.replacement === 'function'
+            ? rule.replacement(match)
+            : rule.replacement;
+          if (!replacementValue || replacementValue === value) continue;
+          const key = `${rule.id}:${match.index}:${replacementValue}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          matches.push({
+            offset: match.index,
+            length: value.length,
+            message: rule.message,
+            localPriorityBoost: rule.priorityBoost || 0,
+            replacements: [{ value: replacementValue }],
+            rule: {
+              id: rule.id,
+              issueType: rule.issueType || 'misspelling',
+              category: { id: 'LOCAL_FRENCH' },
+            },
+          });
+        }
+      }
+      return matches;
+    },
+
     getMatchIssueType(match) {
       return String(match?.rule?.issueType || match?.type?.typeName || '').toLowerCase();
     },
@@ -682,6 +863,7 @@
         issueType: this.getMatchIssueType(match),
         categoryId: this.getMatchCategoryId(match),
         ruleId: this.getMatchRuleId(match),
+        localPriorityBoost: Number(match.localPriorityBoost || 0),
         originalWordCount: this.countWords(original),
       };
     },
@@ -778,7 +960,7 @@
     },
 
     scorePreparedMatch(matchInfo, replacementValue, context) {
-      const { issueType, categoryId, length } = matchInfo;
+      const { issueType, categoryId, length, ruleId, localPriorityBoost } = matchInfo;
       let score = 40;
 
       if (issueType === 'misspelling') score += 50;
@@ -792,6 +974,7 @@
       if (categoryId.includes('GRAMMAR')) score += 10;
       if (categoryId.includes('CASING')) score += 6;
       if (categoryId.includes('STYLE')) score -= 14;
+      if (ruleId.startsWith('LOCAL_FR_')) score += 20 + localPriorityBoost;
       if (context.profile.chatLike && (issueType === 'misspelling' || issueType === 'grammar')) score += 6;
       if (context.profile.chatLike && replacementValue.length > length + 8) score -= 10;
       return score;
@@ -824,6 +1007,7 @@
 
       const correctionContext = this.createCorrectionContext(text);
       const cacheKey = this.buildCorrectionCacheKey(text, correctionContext);
+      const hasLocalMatches = this.collectLocalFrenchMatches(text, correctionContext).length > 0;
       if (this.correctionCache.has(cacheKey)) {
         this.renderCorrection(text, this.correctionCache.get(cacheKey), correctionContext);
         return;
@@ -835,14 +1019,18 @@
         method:  'POST',
         url:     'https://api.languagetoolplus.com/v2/check',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        data:    new URLSearchParams({ text, language: 'auto' }).toString(),
+        data:    new URLSearchParams({ text, language: correctionContext.languageHint || 'auto' }).toString(),
         timeout: 10000,
 
         onload: (res) => {
           this.currentRequest = null;
           if (!this.menu) return;
           this.setLoadingState(false);
-          if (res.status < 200 || res.status >= 300) { this.showCorrectionError(); return; }
+          if (res.status < 200 || res.status >= 300) {
+            if (hasLocalMatches) this.renderCorrection(text, [], correctionContext);
+            else this.showCorrectionError();
+            return;
+          }
           try {
             const matches = JSON.parse(res.responseText).matches || [];
             if (this.correctionCache.size >= 50 && !this.correctionCache.has(cacheKey)) {
@@ -852,17 +1040,22 @@
             this.correctionCache.set(cacheKey, matches);
             this.renderCorrection(text, matches, correctionContext);
           }
-          catch (_) { this.showCorrectionError(); }
+          catch (_) {
+            if (hasLocalMatches) this.renderCorrection(text, [], correctionContext);
+            else this.showCorrectionError();
+          }
         },
         onerror: () => {
           this.currentRequest = null;
           this.setLoadingState(false);
-          this.showCorrectionError();
+          if (hasLocalMatches) this.renderCorrection(text, [], correctionContext);
+          else this.showCorrectionError();
         },
         ontimeout: () => {
           this.currentRequest = null;
           this.setLoadingState(false);
-          this.showCorrectionError('Délai dépassé.');
+          if (hasLocalMatches) this.renderCorrection(text, [], correctionContext);
+          else this.showCorrectionError('Délai dépassé.');
         },
       });
     },
@@ -950,7 +1143,7 @@
     },
 
     prepareMatches(text, matches, correctionContext = this.createCorrectionContext(text)) {
-      const candidates = (matches || [])
+      const candidates = [...this.collectLocalFrenchMatches(text, correctionContext), ...(matches || [])]
         .filter((match) => match && Array.isArray(match.replacements) && match.replacements.length > 0)
         .map((match) => {
           const matchInfo = this.createMatchInfo(match, text);
