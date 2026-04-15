@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.2.9
+// @version        4.3.0
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -580,47 +580,75 @@
           };
 
           // ── Stratégie A : fiber React → remplacement direct du ContentState ──
-          // Twitch's handlePastedText ignore la sélection et fait toujours insertText
-          // (jamais replaceText). La seule solution fiable : trouver le EditorState
-          // via le fiber React et remplacer directement le ContentState.
-          // Object.getOwnPropertyNames() pour trouver les props non-énumérables.
           let usedDraftFiber = false;
           try {
             const allKeys = Object.getOwnPropertyNames(editableEl);
             const rKey = allKeys.find(k =>
               k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
             );
-            dbg('fiber: rKey=' + (rKey ? rKey.slice(0, 30) : 'null') +
-                ' totalKeys=' + allKeys.length);
+            dbg('fiber: rKey=' + (rKey ? rKey.slice(0, 30) : 'null'));
 
             if (rKey) {
+              const isES = (v) => v && typeof v === 'object' && (
+                (typeof v.getSelection === 'function' && typeof v.getCurrentContent === 'function') ||
+                (typeof v.get === 'function' && typeof v.merge === 'function' && typeof v.set === 'function')
+              );
+
               let fiber = editableEl[rKey];
               let depth = 0;
               let draftProps = null;
 
-              while (fiber && depth < 100 && !draftProps) {
-                // ① memoizedProps (class component ou fonction recevant des props)
+              while (fiber && depth < 300 && !draftProps) {
+                // ① memoizedProps : scan toutes les props pour trouver un EditorState
                 const p = fiber.memoizedProps;
-                if (p && typeof p.onChange === 'function' && p.editorState &&
-                    typeof p.editorState.getSelection === 'function' &&
-                    typeof p.editorState.getCurrentContent === 'function') {
-                  dbg('fiber: props match at depth=' + depth);
-                  draftProps = { editorState: p.editorState, onChange: p.onChange };
+                if (p && typeof p === 'object') {
+                  for (const k of Object.keys(p)) {
+                    if (isES(p[k])) {
+                      const onCh = typeof p.onChange === 'function' ? p.onChange
+                                 : typeof p.onEditorStateChange === 'function' ? p.onEditorStateChange
+                                 : null;
+                      if (onCh) {
+                        dbg('fiber: editorState prop="' + k + '" at depth=' + depth);
+                        draftProps = { editorState: p[k], onChange: onCh };
+                        break;
+                      }
+                    }
+                  }
                 }
 
-                // ② memoizedState hooks (useState dans une fonction component)
+                // ② stateNode : instance de classe (DraftEditor ou composant parent)
+                if (!draftProps) {
+                  const inst = fiber.stateNode;
+                  if (inst && typeof inst === 'object' && !(inst instanceof Element)) {
+                    // DraftEditor via getEditorKey
+                    if (typeof inst.getEditorKey === 'function' &&
+                        inst.props && isES(inst.props.editorState) &&
+                        typeof inst.props.onChange === 'function') {
+                      dbg('fiber: DraftEditor stateNode at depth=' + depth);
+                      draftProps = { editorState: inst.props.editorState, onChange: inst.props.onChange };
+                    }
+                    // Composant parent avec editorState en state
+                    if (!draftProps && inst.state && typeof inst.state === 'object') {
+                      for (const k of Object.keys(inst.state)) {
+                        if (isES(inst.state[k]) && typeof inst.setState === 'function') {
+                          dbg('fiber: stateNode.state["' + k + '"] at depth=' + depth);
+                          const sk = k, si = inst;
+                          draftProps = { editorState: inst.state[k], onChange: (es) => si.setState({ [sk]: es }) };
+                          break;
+                        }
+                      }
+                    }
+                  }
+                }
+
+                // ③ hooks useState
                 if (!draftProps) {
                   let hook = fiber.memoizedState;
                   let hi = 0;
-                  while (hook && hi < 30) {
-                    const hs = hook.memoizedState;
-                    if (hs && typeof hs.getSelection === 'function' &&
-                        typeof hs.getCurrentContent === 'function') {
-                      const dispatch = hook.queue && hook.queue.dispatch;
-                      if (dispatch) {
-                        dbg('fiber: hook[' + hi + '] match at depth=' + depth);
-                        draftProps = { editorState: hs, onChange: dispatch };
-                      }
+                  while (hook && hi < 20) {
+                    if (isES(hook.memoizedState) && hook.queue?.dispatch) {
+                      dbg('fiber: hook[' + hi + '] at depth=' + depth);
+                      draftProps = { editorState: hook.memoizedState, onChange: hook.queue.dispatch };
                       break;
                     }
                     hook = hook.next;
@@ -628,76 +656,88 @@
                   }
                 }
 
+                // checkpoint debug tous les 50 niveaux
+                if (!draftProps && depth % 50 === 0 && depth > 0) {
+                  const p2 = fiber.memoizedProps;
+                  dbg('fiber: depth=' + depth + ' hasOnChange=' + !!(p2 && typeof p2.onChange === 'function'));
+                }
+
                 if (!draftProps) { fiber = fiber.return; depth++; }
               }
 
-              dbg('fiber: found=' + !!draftProps + ' depth=' + depth);
+              dbg('fiber: found=' + !!draftProps + ' depth=' + depth + ' fiberNull=' + !fiber);
 
               if (draftProps) {
                 const { editorState, onChange } = draftProps;
-                const cs    = editorState.getCurrentContent();
-                const sel   = editorState.getSelection();
-                const CS    = cs.constructor;    // ContentState class
-                const ES    = editorState.constructor; // EditorState class
+                const getContent = () => editorState.getCurrentContent
+                  ? editorState.getCurrentContent()
+                  : editorState.get('currentContent');
+                const cs  = getContent();
+                const sel = editorState.getSelection ? editorState.getSelection() : editorState.get('selection');
+                const CS  = cs.constructor;
+                const ES  = editorState.constructor;
 
-                if (typeof CS.createFromText === 'function' &&
-                    typeof ES.createWithContent === 'function') {
-                  // Créer un ContentState avec uniquement le texte corrigé
+                dbg('fiber: CS.createFromText=' + typeof CS.createFromText + ' ES.createWithContent=' + typeof ES.createWithContent);
+
+                if (typeof CS.createFromText === 'function' && typeof ES.createWithContent === 'function') {
                   const newContent = CS.createFromText(corrected);
-                  const lastBlk    = newContent.getLastBlock();
-
-                  // Curseur à la fin du texte corrigé
+                  const lastBlk    = newContent.getLastBlock ? newContent.getLastBlock()
+                                   : newContent.get('blockMap').last();
+                  const blkKey = lastBlk.getKey ? lastBlk.getKey() : lastBlk.get('key');
+                  const blkLen = lastBlk.getLength ? lastBlk.getLength() : lastBlk.get('text').length;
                   const newSel = sel.merge({
-                    anchorKey:    lastBlk.getKey(),
-                    anchorOffset: lastBlk.getLength(),
-                    focusKey:     lastBlk.getKey(),
-                    focusOffset:  lastBlk.getLength(),
-                    hasFocus:     true,
-                    isBackward:   false,
+                    anchorKey: blkKey, anchorOffset: blkLen,
+                    focusKey:  blkKey, focusOffset:  blkLen,
+                    hasFocus: true, isBackward: false,
                   });
-
-                  const newES = ES.forceSelection(ES.createWithContent(newContent), newSel);
-                  onChange(newES);
+                  onChange(ES.forceSelection(ES.createWithContent(newContent), newSel));
                   snap('B_draft_content_replaced', editableEl);
                   usedDraftFiber = true;
-
-                  setTimeout(() => {
-                    editableEl.focus();
-                    finalize();
-                  }, 30);
-                } else {
-                  dbg('fiber: CS.createFromText or ES.createWithContent missing');
+                  setTimeout(() => { editableEl.focus(); finalize(); }, 30);
                 }
               }
             }
-          } catch (e) { dbg('fiber error: ' + e.message + ' | ' + (e.stack || '').slice(0, 120)); }
+          } catch (e) { dbg('fiber error: ' + e.message + ' | ' + (e.stack || '').slice(0, 100)); }
 
           if (usedDraftFiber) return;
 
-          // ── Stratégie B : fallback selectAll + paste ─────────────────────────
+          // ── Stratégie B : selectAll → Delete → paste dans éditeur vide ───────
+          // Twitch's paste handler fait toujours insertText (append) jamais replaceText.
+          // Workaround : vider l'éditeur avec Delete sur la sélection, puis coller.
           editableEl.focus();
           snap('B_focus_done', editableEl);
           setTimeout(() => {
             document.execCommand('selectAll');
             snap('B2_apres_selectAll', editableEl);
+
+            // Draft.js traite selectionchange → SelectionState = "tout sélectionné"
             setTimeout(() => {
-              editableEl.focus();
-              snap('B2_avant_paste', editableEl);
-              try {
-                const dt = new DataTransfer();
-                dt.setData('text/plain', corrected);
-                const pasteEvt = new ClipboardEvent('paste', {
-                  bubbles: true, cancelable: true, clipboardData: dt,
-                });
-                const handled = !editableEl.dispatchEvent(pasteEvt);
-                snap('C_paste_dispatched_handled=' + handled, editableEl);
-                if (!handled) {
-                  const ok = document.execCommand('insertText', false, corrected);
-                  snap('D_execCommand_ok=' + ok, editableEl);
-                }
-              } catch (err) { dbg('paste error: ' + err.message); }
-              finalize();
-            }, 20);
+              // Supprimer la sélection via keydown Delete (Draft.js gère cet event)
+              editableEl.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'Delete', code: 'Delete', bubbles: true, cancelable: true,
+              }));
+              snap('B3_apres_delete_kd', editableEl);
+
+              // Attendre que React re-render avec l'éditeur vide
+              setTimeout(() => {
+                editableEl.focus();
+                snap('B4_avant_paste', editableEl);
+                try {
+                  const dt = new DataTransfer();
+                  dt.setData('text/plain', corrected);
+                  const pasteEvt = new ClipboardEvent('paste', {
+                    bubbles: true, cancelable: true, clipboardData: dt,
+                  });
+                  const handled = !editableEl.dispatchEvent(pasteEvt);
+                  snap('C_paste_dispatched_handled=' + handled, editableEl);
+                  if (!handled) {
+                    const ok = document.execCommand('insertText', false, corrected);
+                    snap('D_execCommand_ok=' + ok, editableEl);
+                  }
+                } catch (err) { dbg('paste error: ' + err.message); }
+                finalize();
+              }, 25);
+            }, 25);
           }, 30);
           return;
         }
