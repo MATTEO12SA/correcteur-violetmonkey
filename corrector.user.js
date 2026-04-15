@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.2.0
+// @version        4.2.1
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -491,16 +491,12 @@
           if (sel) { sel.removeAllRanges(); sel.addRange(this.selectedRange); }
           // execCommand UNIQUEMENT ici : préserve le Ctrl+Z natif du navigateur
           if (document.execCommand('insertText', false, corrected)) {
-            // Sauvegarde curseur AVANT closeMenu() : la suppression du bouton focusé
-            // déplace le focus sur <body> et efface la sélection du contenteditable.
-            const afterRange = sel && sel.rangeCount > 0 ? sel.getRangeAt(0).cloneRange() : null;
             this.lastApply = { type: 'contenteditable' }; // Ctrl+Z natif suffit
-            this.closeMenu();
+            // Focus AVANT closeMenu() : ainsi quand le bouton est supprimé du DOM,
+            // le focus est déjà sur editableEl → pas de saut sur <body>,
+            // la sélection posée par execCommand est préservée sans la sauvegarder.
             editableEl.focus();
-            if (afterRange) {
-              const s = window.getSelection();
-              if (s) { s.removeAllRanges(); s.addRange(afterRange); }
-            }
+            this.closeMenu();
             this.showConfirmation(false); // Ctrl+Z disponible → pas de bouton Annuler
             return;
           }
@@ -510,8 +506,8 @@
           this.selectedRange.insertNode(tn);
           const nr = document.createRange();
           nr.setStartAfter(tn); nr.collapse(true);
-          this.closeMenu();
           editableEl.focus();
+          this.closeMenu();
           const s = window.getSelection();
           if (s) { s.removeAllRanges(); s.addRange(nr); }
           this.showConfirmation(false);
