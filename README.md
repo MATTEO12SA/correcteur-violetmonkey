@@ -56,6 +56,9 @@ Pour forcer une mise à jour manuelle :
 
 - Détection automatique de la langue
 - Diff visuel : erreurs soulignées en rouge, corrections surlignées en vert
+- Modes de correction `Chat`, `Équilibré` et `Strict` via l'engrenage
+- Filtrage intelligent des suggestions trop agressives sur les messages courts et le chat
+- Protection des `@mentions`, `#hashtags`, URLs, emails et blocs inline sensibles
 - Panneau déplaçable, position mémorisée entre les sessions
 - Compatible avec les SPA (Facebook, Instagram, Twitter…)
 - Dark mode automatique
@@ -67,6 +70,7 @@ Pour forcer une mise à jour manuelle :
 
 Le mode debug est désactivé par défaut.
 
+- Le même engrenage permet aussi de choisir le niveau de correction (`Chat`, `Équilibré`, `Strict`)
 - Méthode recommandée : ouvre le panneau du correcteur puis clique sur l'engrenage pour activer les logs
 - Les logs se téléchargent manuellement via le bouton `Télécharger les logs` dans ce même panneau
 - Activer temporairement sur une page : ajoute `?correctorDebug=1` à l'URL

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.5.1
+// @version        4.6.0
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -19,9 +19,12 @@
   const STORAGE_KEY = '__corrector_v4_pos';
   const DEBUG_STORAGE_KEY = '__corrector_debug';
   const CONFIRMATION_STORAGE_KEY = '__corrector_confirmation';
+  const CORRECTION_MODE_STORAGE_KEY = '__corrector_mode';
   const NAV_EVENT = '_corrector_nav';
   const HISTORY_PATCH_FLAG = '__corrector_history_patched';
   const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url', 'tel', 'email', 'password']);
+  const CORRECTION_MODES = new Set(['chat-lite', 'balanced', 'strict']);
+  const DEFAULT_CORRECTION_MODE = 'balanced';
 
   const readStoredFlag = (key) => {
     try {
@@ -38,6 +41,22 @@
     } catch (_) {}
   };
 
+  const readStoredValue = (key, fallback = '') => {
+    try {
+      const value = localStorage.getItem(key);
+      return value == null ? fallback : value;
+    } catch (_) {
+      return fallback;
+    }
+  };
+
+  const writeStoredValue = (key, value) => {
+    try {
+      if (value == null || value === '') localStorage.removeItem(key);
+      else localStorage.setItem(key, value);
+    } catch (_) {}
+  };
+
   const URL_DEBUG_ENABLED = (() => {
     try {
       const params = new URLSearchParams(window.location.search);
@@ -49,6 +68,9 @@
 
   let debugEnabled = URL_DEBUG_ENABLED || readStoredFlag(DEBUG_STORAGE_KEY);
   let confirmationEnabled = readStoredFlag(CONFIRMATION_STORAGE_KEY);
+  let correctionMode = CORRECTION_MODES.has(readStoredValue(CORRECTION_MODE_STORAGE_KEY))
+    ? readStoredValue(CORRECTION_MODE_STORAGE_KEY)
+    : DEFAULT_CORRECTION_MODE;
   const _logs = [];
 
   const isTextControl = (el) => {
@@ -221,6 +243,20 @@
       this.syncSettingsPanel();
     },
 
+    setCorrectionMode(mode) {
+      if (!CORRECTION_MODES.has(mode)) mode = DEFAULT_CORRECTION_MODE;
+      correctionMode = mode;
+      writeStoredValue(CORRECTION_MODE_STORAGE_KEY, correctionMode);
+      this.syncSettingsPanel();
+      if (this.menu && this.selectedText) this.fetchCorrection(this.selectedText);
+    },
+
+    getCorrectionModeDescription(mode = correctionMode) {
+      if (mode === 'chat-lite') return 'Chat : garde les fautes claires, bloque les corrections trop agressives.';
+      if (mode === 'strict') return 'Strict : applique presque toutes les suggestions LanguageTool.';
+      return 'Équilibré : bon compromis entre corrections utiles et style naturel.';
+    },
+
     toggleSettingsPanel(force) {
       if (!this.menu) return;
       const panel = this.menu.querySelector('.corrector-settings-panel');
@@ -239,11 +275,15 @@
 
       const debugInput = panel.querySelector('.corrector-setting-debug');
       const confirmInput = panel.querySelector('.corrector-setting-confirmation');
+      const modeInput = panel.querySelector('.corrector-setting-mode');
+      const modeHelp = panel.querySelector('.corrector-mode-help');
       const downloadBtn = panel.querySelector('.corrector-download-logs-btn');
       const status = panel.querySelector('.corrector-settings-status');
 
       if (debugInput) debugInput.checked = debugEnabled;
       if (confirmInput) confirmInput.checked = confirmationEnabled;
+      if (modeInput) modeInput.value = correctionMode;
+      if (modeHelp) modeHelp.textContent = this.getCorrectionModeDescription();
       if (downloadBtn) downloadBtn.disabled = !debugEnabled;
       if (status) {
         status.textContent = debugEnabled
@@ -447,13 +487,247 @@
     // ─────────────────────────────────────────────
     // API LanguageTool
     // ─────────────────────────────────────────────
+    createCorrectionContext(text) {
+      const host = (window.location.hostname || '').toLowerCase();
+      const profile = this.classifySelectionText(text, host);
+      return {
+        host,
+        mode: correctionMode,
+        profile,
+        protectedRanges: this.collectProtectedRanges(text),
+      };
+    },
+
+    classifySelectionText(text, host) {
+      const source = text || '';
+      const words = source.match(/[\p{L}\p{N}]+(?:[’'-][\p{L}\p{N}]+)*/gu) || [];
+      const letters = source.match(/\p{L}/gu) || [];
+      const urls = source.match(/\b(?:https?:\/\/|www\.)[^\s<>"'`]+/gi) || [];
+      const mentions = source.match(/(^|[\s(])@[A-Za-z0-9_]{2,}/g) || [];
+      const hashtags = source.match(/(^|[\s(])#[\p{L}\p{N}_-]{2,}/gu) || [];
+      const emojis = source.match(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu) || [];
+      const symbols = source.match(/[^\s\p{L}\p{N}]/gu) || [];
+      const hostLooksChat = /(?:^|\.)(?:twitch|kick|discord|slack|telegram|messenger|teams|irccloud|chat)\./i.test(host);
+      const shortText = source.trim().length <= 140;
+      const codeish = /[`{}[\]<>]/.test(source) || /(?:^|\s)(?:npm|pnpm|yarn|git|cd|ls|rm|cp|mv|sudo|npx)\b/i.test(source);
+      const symbolRatio = source.length ? symbols.length / source.length : 0;
+
+      return {
+        wordCount: words.length,
+        letterCount: letters.length,
+        urlCount: urls.length,
+        mentionCount: mentions.length,
+        hashtagCount: hashtags.length,
+        emojiCount: emojis.length,
+        symbolRatio,
+        codeish,
+        chatLike: hostLooksChat || mentions.length > 0 || hashtags.length > 0 || emojis.length > 0 || (shortText && symbolRatio > 0.08),
+      };
+    },
+
+    buildCorrectionCacheKey(text, context) {
+      const flavor = context.profile.chatLike ? 'chat' : 'prose';
+      return [context.host, context.mode, flavor, text].join('||');
+    },
+
+    collectProtectedRanges(text) {
+      const ranges = [
+        ...this.collectPatternRanges(text, /\b(?:https?:\/\/|www\.)[^\s<>"'`]+/gi, 'url'),
+        ...this.collectPatternRanges(text, /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, 'email'),
+        ...this.collectPatternRanges(text, /@[A-Za-z0-9_]{2,}/g, 'mention'),
+        ...this.collectPatternRanges(text, /#[\p{L}\p{N}_-]{2,}/gu, 'hashtag'),
+        ...this.collectPatternRanges(text, /`[^`\n]+`/g, 'code'),
+      ].sort((a, b) => a.start - b.start || a.end - b.end);
+
+      const merged = [];
+      for (const range of ranges) {
+        const last = merged[merged.length - 1];
+        if (last && range.start <= last.end) {
+          last.end = Math.max(last.end, range.end);
+          continue;
+        }
+        merged.push({ ...range });
+      }
+      return merged;
+    },
+
+    collectPatternRanges(text, regex, kind) {
+      const source = text || '';
+      if (!source) return [];
+      const flags = regex.flags.includes('g') ? regex.flags : regex.flags + 'g';
+      const pattern = new RegExp(regex.source, flags);
+      const ranges = [];
+      let match;
+      while ((match = pattern.exec(source))) {
+        const value = match[0];
+        if (!value) {
+          pattern.lastIndex += 1;
+          continue;
+        }
+        ranges.push({ start: match.index, end: match.index + value.length, kind });
+      }
+      return ranges;
+    },
+
+    rangesOverlap(start, end, ranges) {
+      return ranges.some((range) => start < range.end && end > range.start);
+    },
+
+    countWords(text) {
+      return (text.match(/[\p{L}\p{N}]+(?:[’'-][\p{L}\p{N}]+)*/gu) || []).length;
+    },
+
+    getMatchIssueType(match) {
+      return String(match?.rule?.issueType || match?.type?.typeName || '').toLowerCase();
+    },
+
+    getMatchCategoryId(match) {
+      return String(match?.rule?.category?.id || '').toUpperCase();
+    },
+
+    getMatchRuleId(match) {
+      return String(match?.rule?.id || '').toUpperCase();
+    },
+
+    isSentenceStart(text, offset) {
+      const before = (text || '').slice(0, offset).trimEnd();
+      return !before || /[.!?…]\s*$/.test(before);
+    },
+
+    upperCaseFirstLetter(text) {
+      return text.replace(/\p{L}/u, (letter) => letter.toUpperCase());
+    },
+
+    lowerCaseFirstLetter(text) {
+      return text.replace(/\p{L}/u, (letter) => letter.toLowerCase());
+    },
+
+    normalizeReplacementCasing(original, replacement, text, offset) {
+      const originalLetters = (original || '').replace(/[^\p{L}]/gu, '');
+      if (!originalLetters) return replacement;
+      if (originalLetters.length > 1 && originalLetters === originalLetters.toUpperCase()) {
+        return replacement.toUpperCase();
+      }
+      if (/^\p{Lu}[\p{Ll}]+$/u.test(originalLetters)) {
+        return this.upperCaseFirstLetter(replacement);
+      }
+      if (
+        originalLetters === originalLetters.toLowerCase() &&
+        !this.isSentenceStart(text, offset) &&
+        /^\p{Lu}[\p{Ll}]+$/u.test((replacement || '').replace(/[^\p{L}]/gu, ''))
+      ) {
+        return this.lowerCaseFirstLetter(replacement);
+      }
+      return replacement;
+    },
+
+    isReplacementSafe(match, replacement, original, context) {
+      if (!replacement || replacement === original) return false;
+      const originalWords = this.countWords(original);
+      const replacementWords = this.countWords(replacement);
+      const issueType = this.getMatchIssueType(match);
+
+      if (context.mode !== 'strict' && replacement.length > Math.max(original.length * 3, original.length + 24)) return false;
+      if (context.mode === 'chat-lite' && replacementWords > Math.max(originalWords + 2, 4) && replacement.length > original.length + 10) return false;
+      if (context.profile.chatLike && issueType === 'style') return false;
+      if (context.profile.chatLike && /[A-Z]{3,}/.test(replacement) && !/[A-Z]{3,}/.test(original)) return false;
+      return true;
+    },
+
+    scoreReplacementCandidate(match, replacement, original, context) {
+      const issueType = this.getMatchIssueType(match);
+      const originalWords = this.countWords(original);
+      const replacementWords = this.countWords(replacement);
+      let score = 100;
+
+      if (issueType === 'misspelling') score += 16;
+      else if (issueType === 'grammar') score += 14;
+      else if (issueType === 'typographical') score += 8;
+      else if (issueType === 'whitespace') score += 5;
+      else if (issueType === 'style') score -= 18;
+
+      score -= Math.abs(replacement.length - original.length);
+      score -= Math.max(0, replacementWords - originalWords) * (context.mode === 'chat-lite' ? 6 : 3);
+      if (context.profile.chatLike && replacement.length > original.length + 8) score -= 10;
+      if (replacement.includes('\n')) score -= 20;
+      return score;
+    },
+
+    pickReplacement(match, text, context) {
+      const original = text.slice(match.offset, match.offset + match.length);
+      const candidates = [];
+      for (const replacement of (match.replacements || []).slice(0, 5)) {
+        const value = replacement && typeof replacement.value === 'string'
+          ? replacement.value.replace(/\u00A0/g, ' ')
+          : '';
+        if (!value || candidates.includes(value)) continue;
+        candidates.push(value);
+      }
+
+      let best = null;
+      for (const candidate of candidates) {
+        const normalized = this.normalizeReplacementCasing(original, candidate, text, match.offset);
+        if (!this.isReplacementSafe(match, normalized, original, context)) continue;
+        const score = this.scoreReplacementCandidate(match, normalized, original, context);
+        if (!best || score > best.score) best = { value: normalized, score };
+      }
+      return best ? best.value : null;
+    },
+
+    scorePreparedMatch(match, replacementValue, context) {
+      const issueType = this.getMatchIssueType(match);
+      const categoryId = this.getMatchCategoryId(match);
+      let score = 40;
+
+      if (issueType === 'misspelling') score += 50;
+      else if (issueType === 'grammar') score += 44;
+      else if (issueType === 'typographical') score += 34;
+      else if (issueType === 'whitespace') score += 24;
+      else if (issueType === 'duplication') score += 18;
+      else if (issueType === 'style') score -= 20;
+      else if (issueType === 'locale-violation') score -= 24;
+
+      if (categoryId.includes('GRAMMAR')) score += 10;
+      if (categoryId.includes('CASING')) score += 6;
+      if (categoryId.includes('STYLE')) score -= 14;
+      if (context.profile.chatLike && (issueType === 'misspelling' || issueType === 'grammar')) score += 6;
+      if (context.profile.chatLike && replacementValue.length > match.length + 8) score -= 10;
+      return score;
+    },
+
+    shouldKeepMatch(match, replacementValue, text, context) {
+      if (!match || !replacementValue) return false;
+
+      const start = match.offset;
+      const end = match.offset + match.length;
+      const issueType = this.getMatchIssueType(match);
+      const categoryId = this.getMatchCategoryId(match);
+      const ruleId = this.getMatchRuleId(match);
+      const original = text.slice(start, end);
+
+      if (this.rangesOverlap(start, end, context.protectedRanges)) return false;
+      if (context.mode !== 'strict') {
+        if (issueType === 'style' || issueType === 'locale-violation') return false;
+        if (categoryId.includes('STYLE') || categoryId.includes('REGISTER')) return false;
+      }
+      if (context.mode === 'chat-lite') {
+        if (issueType === 'duplication' && original.trim().length <= 2) return false;
+        if (issueType === 'whitespace' && !/\s{2,}/.test(original) && !/[,:;!?]/.test(replacementValue)) return false;
+        if (categoryId.includes('PUNCTUATION') && replacementValue.length > original.length + 3 && !/[.!?]/.test(original)) return false;
+      }
+      if (context.profile.codeish && context.mode !== 'strict' && /[\\/]|(?:^|_)[A-Z0-9_]+(?:$|_)/.test(original)) return false;
+      if (ruleId.includes('TYPOGRAF') && context.mode === 'chat-lite' && context.profile.chatLike) return false;
+      return true;
+    },
+
     fetchCorrection(text) {
       if (!this.menu) return;
       if (this.currentRequest) { this.currentRequest.abort(); this.currentRequest = null; }
 
-      const cacheKey = text;
+      const correctionContext = this.createCorrectionContext(text);
+      const cacheKey = this.buildCorrectionCacheKey(text, correctionContext);
       if (this.correctionCache.has(cacheKey)) {
-        this.renderCorrection(text, this.correctionCache.get(cacheKey));
+        this.renderCorrection(text, this.correctionCache.get(cacheKey), correctionContext);
         return;
       }
 
@@ -478,7 +752,7 @@
               if (oldestKey) this.correctionCache.delete(oldestKey);
             }
             this.correctionCache.set(cacheKey, matches);
-            this.renderCorrection(text, matches);
+            this.renderCorrection(text, matches, correctionContext);
           }
           catch (_) { this.showCorrectionError(); }
         },
@@ -524,11 +798,11 @@
     // ─────────────────────────────────────────────
     // Rendu du diff
     // ─────────────────────────────────────────────
-    renderCorrection(text, matches) {
+    renderCorrection(text, matches, correctionContext = this.createCorrectionContext(text)) {
       if (!this.menu) return;
 
       this.resetActionState();
-      const preparedMatches = this.prepareMatches(matches);
+      const preparedMatches = this.prepareMatches(text, matches, correctionContext);
       const corrected = this.applyMatches(text, preparedMatches);
 
       // Badge erreurs
@@ -560,7 +834,7 @@
         corrEl.replaceChildren(...this.buildSpans(text, preparedMatches, (m) => {
           const s = document.createElement('span');
           s.className   = 'corrector-fix';
-          s.textContent = m.replacements[0].value;
+          s.textContent = m.replacementValue;
           return s;
         }));
 
@@ -575,18 +849,31 @@
       }
     },
 
-    prepareMatches(matches) {
-      const sorted = (matches || [])
-        .filter((match) => match && match.replacements && match.replacements.length > 0)
-        .slice()
-        .sort((a, b) => a.offset - b.offset);
+    prepareMatches(text, matches, correctionContext = this.createCorrectionContext(text)) {
+      const candidates = (matches || [])
+        .filter((match) => match && Array.isArray(match.replacements) && match.replacements.length > 0)
+        .map((match) => {
+          const replacementValue = this.pickReplacement(match, text, correctionContext);
+          if (!this.shouldKeepMatch(match, replacementValue, text, correctionContext)) return null;
+          return {
+            ...match,
+            replacementValue,
+            priority: this.scorePreparedMatch(match, replacementValue, correctionContext),
+          };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.offset - b.offset || b.priority - a.priority || a.length - b.length);
 
       const prepared = [];
-      let cursor = 0;
-      for (const match of sorted) {
-        if (match.offset < cursor) continue;
-        prepared.push(match);
-        cursor = match.offset + match.length;
+      for (const match of candidates) {
+        const last = prepared[prepared.length - 1];
+        if (!last || match.offset >= last.offset + last.length) {
+          prepared.push(match);
+          continue;
+        }
+        if (match.priority > last.priority || (match.priority === last.priority && match.length < last.length)) {
+          prepared[prepared.length - 1] = match;
+        }
       }
       return prepared;
     },
@@ -608,7 +895,7 @@
       let r = text;
       for (let i = matches.length - 1; i >= 0; i--) {
         const m = matches[i];
-        r = r.slice(0, m.offset) + m.replacements[0].value + r.slice(m.offset + m.length);
+        r = r.slice(0, m.offset) + m.replacementValue + r.slice(m.offset + m.length);
       }
       return r;
     },
@@ -690,6 +977,15 @@
         '  </div>',
         '</div>',
         '<div class="corrector-settings-panel" hidden>',
+        '  <label class="corrector-setting-stack">',
+        '    <span>Mode de correction</span>',
+        '    <select class="corrector-setting-mode">',
+        '      <option value="chat-lite">Chat</option>',
+        '      <option value="balanced">Équilibré</option>',
+        '      <option value="strict">Strict</option>',
+        '    </select>',
+        '    <span class="corrector-mode-help"></span>',
+        '  </label>',
         '  <label class="corrector-setting-row">',
         '    <input type="checkbox" class="corrector-setting-debug">',
         '    <span>Activer les logs de debug</span>',
@@ -759,6 +1055,9 @@
       });
       menu.querySelector('.corrector-setting-confirmation').addEventListener('change', (e) => {
         this.setConfirmationEnabled(e.currentTarget.checked);
+      });
+      menu.querySelector('.corrector-setting-mode').addEventListener('change', (e) => {
+        this.setCorrectionMode(e.currentTarget.value);
       });
       menu.querySelector('.corrector-download-logs-btn').addEventListener('click', () => downloadLogs());
       menu.addEventListener('keydown', (e) => this.handleMenuKeyDown(e));
@@ -1369,7 +1668,28 @@
           font-size: 12px;
           color: #7c2d12;
         }
+        .corrector-setting-stack {
+          display: grid;
+          gap: 6px;
+          font-size: 12px;
+          color: #7c2d12;
+        }
         .corrector-setting-row input { margin: 0; }
+        .corrector-setting-mode {
+          cursor: pointer;
+          border: 1px solid #fdba74;
+          border-radius: 6px;
+          background: #fff;
+          color: #7c2d12;
+          padding: 6px 8px;
+          font-size: 12px;
+          font-weight: 600;
+        }
+        .corrector-mode-help {
+          font-size: 11px;
+          line-height: 1.4;
+          color: #9a3412;
+        }
         .corrector-settings-status {
           font-size: 11px;
           line-height: 1.4;
@@ -1505,7 +1825,10 @@
           .corrector-settings-btn:hover,
           .corrector-close-btn:hover    { background:#3f3f46; color:#f4f4f5; }
           .corrector-settings-panel     { background:#2b2116; border-color:#713f12; }
-          .corrector-setting-row        { color:#fdba74; }
+          .corrector-setting-row,
+          .corrector-setting-stack      { color:#fdba74; }
+          .corrector-setting-mode       { background:#18181b; border-color:#f59e0b; color:#fbbf24; }
+          .corrector-mode-help,
           .corrector-settings-status    { color:#fb923c; }
           .corrector-download-logs-btn  { background:#18181b; border-color:#f59e0b; color:#fbbf24; }
           .corrector-download-logs-btn:hover:not(:disabled) { background:#f59e0b; color:#18181b; }
