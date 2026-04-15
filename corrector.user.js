@@ -17,6 +17,8 @@
   'use strict';
 
   const STORAGE_KEY = '__corrector_v4_pos';
+  const DEBUG = true; // ← mettre false pour désactiver les logs
+  const dbg = (...a) => DEBUG && console.log('[Correcteur DEBUG]', ...a);
 
   const TextCorrector = {
     selectedText:   '',
@@ -484,23 +486,34 @@
         // ── Cas 2 : contenteditable ─────────────────
         const editableEl = parent && parent.closest('[contenteditable="true"], [contenteditable=""]');
         if (editableEl) {
+          dbg('1) editableEl trouvé:', editableEl.tagName, '| contenteditable:', editableEl.getAttribute('contenteditable'));
+          dbg('1) activeElement avant tout:', document.activeElement?.tagName, document.activeElement?.className);
           if (!this.isRangeValid()) {
             this.showApplyError('Le texte a changé depuis la sélection. Resélectionnez.');
             return;
           }
           if (sel) { sel.removeAllRanges(); sel.addRange(this.selectedRange); }
-          // execCommand UNIQUEMENT ici : préserve le Ctrl+Z natif du navigateur
-          if (document.execCommand('insertText', false, corrected)) {
-            this.lastApply = { type: 'contenteditable' }; // Ctrl+Z natif suffit
-            // Focus AVANT closeMenu() : ainsi quand le bouton est supprimé du DOM,
-            // le focus est déjà sur editableEl → pas de saut sur <body>,
-            // la sélection posée par execCommand est préservée sans la sauvegarder.
+          dbg('2) selection restaurée, rangeCount:', window.getSelection()?.rangeCount);
+          const execOk = document.execCommand('insertText', false, corrected);
+          dbg('3) execCommand résultat:', execOk, '| activeElement après:', document.activeElement?.tagName, document.activeElement?.className);
+          dbg('3) selection après execCommand, rangeCount:', window.getSelection()?.rangeCount, '| texte sélectionné:', JSON.stringify(window.getSelection()?.toString()));
+          if (execOk) {
+            this.lastApply = { type: 'contenteditable' };
             editableEl.focus();
+            dbg('4) après editableEl.focus(), activeElement:', document.activeElement?.tagName, document.activeElement?.className);
+            dbg('4) selection après focus, rangeCount:', window.getSelection()?.rangeCount);
             this.closeMenu();
-            this.showConfirmation(false); // Ctrl+Z disponible → pas de bouton Annuler
+            dbg('5) après closeMenu(), activeElement:', document.activeElement?.tagName, document.activeElement?.className);
+            dbg('5) selection finale, rangeCount:', window.getSelection()?.rangeCount);
+            // Log keydown pendant 5s pour voir si les frappes arrivent bien
+            const _dbgKd = (e) => dbg('KEYDOWN reçu:', e.key, '| activeElement:', document.activeElement?.tagName, document.activeElement?.className);
+            document.addEventListener('keydown', _dbgKd);
+            setTimeout(() => document.removeEventListener('keydown', _dbgKd), 5000);
+            this.showConfirmation(false);
             return;
           }
           // Fallback si execCommand échoue
+          dbg('3) execCommand a échoué → fallback DOM');
           this.selectedRange.deleteContents();
           const tn = document.createTextNode(corrected);
           this.selectedRange.insertNode(tn);
@@ -510,6 +523,7 @@
           this.closeMenu();
           const s = window.getSelection();
           if (s) { s.removeAllRanges(); s.addRange(nr); }
+          dbg('fallback) activeElement final:', document.activeElement?.tagName, '| rangeCount:', window.getSelection()?.rangeCount);
           this.showConfirmation(false);
           return;
         }
