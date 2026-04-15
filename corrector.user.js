@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.2.5
+// @version        4.2.6
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -575,36 +575,38 @@
           watchKeys(editableEl, 8000);
 
           // ── Stratégie 1 : paste simulé ──────────────────────────────────────
-          // Twitch/React ne met PAS à jour son état interne via execCommand.
-          // Le paste handler de l'éditeur, lui, met bien à jour l'état React.
-          // On crée un ClipboardEvent avec le texte corrigé dans le DataTransfer.
-          let handled = false;
-          try {
-            const dt = new DataTransfer();
-            dt.setData('text/plain', corrected);
-            dt.setData('text/html',  corrected);
-            const pasteEvt = new ClipboardEvent('paste', {
-              bubbles: true, cancelable: true, clipboardData: dt,
-            });
-            handled = !editableEl.dispatchEvent(pasteEvt); // false = preventDefault appelé = géré
-            snap('C_paste_dispatched_handled=' + handled, editableEl);
-          } catch (err) {
-            dbg('paste dispatch error: ' + err.message);
-          }
+          // On attend 50 ms pour que Draft.js traite le selectionchange émis par
+          // addRange() et synchronise son SelectionState interne AVANT le paste.
+          // Sans ce délai, Draft.js paste à la position du curseur (fin de texte)
+          // au lieu de remplacer la sélection → doublement du texte.
+          setTimeout(() => {
+            snap('B2_avant_paste', editableEl);
+            let handled = false;
+            try {
+              const dt = new DataTransfer();
+              dt.setData('text/plain', corrected);
+              dt.setData('text/html',  corrected);
+              const pasteEvt = new ClipboardEvent('paste', {
+                bubbles: true, cancelable: true, clipboardData: dt,
+              });
+              handled = !editableEl.dispatchEvent(pasteEvt);
+              snap('C_paste_dispatched_handled=' + handled, editableEl);
+            } catch (err) {
+              dbg('paste dispatch error: ' + err.message);
+            }
 
-          // ── Stratégie 2 : execCommand (fallback) ────────────────────────────
-          // Utilisé si le paste n'a pas été géré par l'éditeur.
-          // Met à jour le DOM mais PAS forcément l'état React (problème connu sur Twitch).
-          if (!handled) {
-            const execOk = document.execCommand('insertText', false, corrected);
-            snap('D_execCommand_ok=' + execOk, editableEl);
-          }
+            // ── Stratégie 2 : execCommand (fallback) ──────────────────────────
+            if (!handled) {
+              const execOk = document.execCommand('insertText', false, corrected);
+              snap('D_execCommand_ok=' + execOk, editableEl);
+            }
 
-          this.lastApply = { type: 'contenteditable' };
-          editableEl.focus();
-          this.closeMenu();
-          snap('E_apres_closeMenu', editableEl);
-          this.showConfirmation(false);
+            this.lastApply = { type: 'contenteditable' };
+            editableEl.focus();
+            this.closeMenu();
+            snap('E_apres_closeMenu', editableEl);
+            this.showConfirmation(false);
+          }, 50);
           return;
         }
 
