@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.2.2
+// @version        4.2.3
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -19,12 +19,76 @@
   const STORAGE_KEY = '__corrector_v4_pos';
   const DEBUG = true;
   const _logs = [];
+
   const dbg = (...a) => {
     if (!DEBUG) return;
     const line = a.map(x => (typeof x === 'object' ? JSON.stringify(x) : String(x))).join(' ');
     _logs.push(new Date().toISOString().slice(11, 23) + ' ' + line);
   };
+
+  // Snapshot complet de l'état du DOM + sélection à un instant T
+  const snap = (label, el) => {
+    if (!DEBUG) return;
+    const sel = window.getSelection();
+    const ae  = document.activeElement;
+    const info = {
+      label,
+      activeEl:   ae ? ae.tagName + '.' + ae.className.split(' ').join('.') : 'none',
+      rangeCount: sel?.rangeCount ?? 0,
+      cursorOffset:    sel?.rangeCount ? sel.getRangeAt(0).startOffset : -1,
+      collapsed:       sel?.rangeCount ? sel.getRangeAt(0).collapsed   : null,
+      anchorNode: sel?.anchorNode?.nodeName ?? 'none',
+      domText:    el ? (el.textContent ?? '').slice(0, 120) : null,
+    };
+    dbg(JSON.stringify(info));
+  };
+
+  // Surveille les mutations DOM sur un élément pendant N ms
+  const watchMutations = (el, ms) => {
+    if (!DEBUG) return;
+    const obs = new MutationObserver((muts) => {
+      for (const m of muts) {
+        dbg('MUTATION type=' + m.type +
+          ' added=' + m.addedNodes.length +
+          ' removed=' + m.removedNodes.length +
+          ' text=' + JSON.stringify((el.textContent ?? '').slice(0, 80)));
+      }
+    });
+    obs.observe(el, { childList: true, subtree: true, characterData: true });
+    setTimeout(() => obs.disconnect(), ms);
+  };
+
+  // Surveille les events clavier + input sur un élément pendant N ms puis télécharge
+  const watchKeys = (el, ms) => {
+    if (!DEBUG) return;
+    const onKd = (e) => dbg('KEYDOWN key=' + JSON.stringify(e.key) +
+      ' code=' + e.code +
+      ' defaultPrevented=' + e.defaultPrevented +
+      ' activeEl=' + document.activeElement?.tagName + '.' + (document.activeElement?.className ?? ''));
+    const onInput = (e) => dbg('INPUT event inputType=' + e.inputType +
+      ' data=' + JSON.stringify(e.data) +
+      ' domText=' + JSON.stringify((el.textContent ?? '').slice(0, 80)));
+    const onSel = () => {
+      const s = window.getSelection();
+      dbg('SELECTIONCHANGE offset=' + (s?.rangeCount ? s.getRangeAt(0).startOffset : -1) +
+        ' collapsed=' + (s?.rangeCount ? s.getRangeAt(0).collapsed : null) +
+        ' activeEl=' + document.activeElement?.tagName);
+    };
+    document.addEventListener('keydown',       onKd);
+    el.addEventListener('input',               onInput);
+    el.addEventListener('beforeinput',         onInput);
+    document.addEventListener('selectionchange', onSel);
+    setTimeout(() => {
+      document.removeEventListener('keydown',        onKd);
+      el.removeEventListener('input',                onInput);
+      el.removeEventListener('beforeinput',          onInput);
+      document.removeEventListener('selectionchange', onSel);
+      downloadLogs();
+    }, ms);
+  };
+
   const downloadLogs = () => {
+    if (!_logs.length) return;
     const blob = new Blob([_logs.join('\n')], { type: 'text/plain' });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement('a');
@@ -349,6 +413,7 @@
         '  <button class="corrector-apply-btn" disabled>Appliquer</button>',
         '  <button class="corrector-copy-btn" style="display:none">Copier</button>',
         '  <button class="corrector-cancel-btn">Fermer</button>',
+        DEBUG ? '  <button class="corrector-debug-btn" title="Télécharger les logs debug">\uD83D\uDC1E</button>' : '',
         '</div>',
       ].join('');
 
@@ -383,6 +448,7 @@
       const close = () => this.closeMenu();
       menu.querySelector('.corrector-cancel-btn').addEventListener('click', close);
       menu.querySelector('.corrector-close-btn').addEventListener('click',  close);
+      if (DEBUG) menu.querySelector('.corrector-debug-btn')?.addEventListener('click', () => downloadLogs());
       menu.addEventListener('keydown', (e) => this.handleMenuKeyDown(e));
 
       document.body.appendChild(menu);
@@ -498,37 +564,38 @@
         // ── Cas 2 : contenteditable ─────────────────
         const editableEl = parent && parent.closest('[contenteditable="true"], [contenteditable=""]');
         if (editableEl) {
-          dbg('1) editableEl trouvé:', editableEl.tagName, '| contenteditable:', editableEl.getAttribute('contenteditable'));
-          dbg('1) activeElement avant tout:', document.activeElement?.tagName, document.activeElement?.className);
+          snap('A_avant_tout', editableEl);
           if (!this.isRangeValid()) {
             this.showApplyError('Le texte a changé depuis la sélection. Resélectionnez.');
             return;
           }
           if (sel) { sel.removeAllRanges(); sel.addRange(this.selectedRange); }
-          dbg('2) selection restaurée, rangeCount:', window.getSelection()?.rangeCount);
+          snap('B_selection_restauree', editableEl);
+          // Lance la surveillance des mutations DOM dès maintenant
+          watchMutations(editableEl, 6000);
           const execOk = document.execCommand('insertText', false, corrected);
-          dbg('3) execCommand résultat:', execOk, '| activeElement après:', document.activeElement?.tagName, document.activeElement?.className);
-          dbg('3) selection après execCommand, rangeCount:', window.getSelection()?.rangeCount, '| texte sélectionné:', JSON.stringify(window.getSelection()?.toString()));
+          snap('C_apres_execCommand_ok=' + execOk, editableEl);
           if (execOk) {
             this.lastApply = { type: 'contenteditable' };
             editableEl.focus();
-            dbg('4) après editableEl.focus(), activeElement:', document.activeElement?.tagName, document.activeElement?.className);
-            dbg('4) selection après focus, rangeCount:', window.getSelection()?.rangeCount);
+            snap('D_apres_focus', editableEl);
             this.closeMenu();
-            dbg('5) après closeMenu(), activeElement:', document.activeElement?.tagName, document.activeElement?.className);
-            dbg('5) selection finale, rangeCount:', window.getSelection()?.rangeCount);
-            // Log keydown pendant 5s puis télécharge le fichier de debug
-            const _dbgKd = (e) => dbg('KEYDOWN reçu:', e.key, '| activeElement:', document.activeElement?.tagName, document.activeElement?.className);
-            document.addEventListener('keydown', _dbgKd);
+            snap('E_apres_closeMenu', editableEl);
+            // Force Draft.js / React à re-synchroniser son SelectionState interne
             setTimeout(() => {
-              document.removeEventListener('keydown', _dbgKd);
-              downloadLogs();
-            }, 5000);
+              if (document.activeElement === editableEl) {
+                editableEl.dispatchEvent(new Event('select', { bubbles: true }));
+                document.dispatchEvent(new Event('selectionchange'));
+                snap('F_apres_select_dispatch', editableEl);
+              }
+              // Surveille clavier + input + selectionchange pendant 6s puis télécharge
+              watchKeys(editableEl, 6000);
+            }, 0);
             this.showConfirmation(false);
             return;
           }
           // Fallback si execCommand échoue
-          dbg('3) execCommand a échoué → fallback DOM');
+          snap('C_execCommand_echoue_fallback', editableEl);
           this.selectedRange.deleteContents();
           const tn = document.createTextNode(corrected);
           this.selectedRange.insertNode(tn);
@@ -538,7 +605,8 @@
           this.closeMenu();
           const s = window.getSelection();
           if (s) { s.removeAllRanges(); s.addRange(nr); }
-          dbg('fallback) activeElement final:', document.activeElement?.tagName, '| rangeCount:', window.getSelection()?.rangeCount);
+          snap('G_fallback_final', editableEl);
+          watchKeys(editableEl, 6000);
           this.showConfirmation(false);
           return;
         }
