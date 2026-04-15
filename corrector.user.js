@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.3.0
+// @version        4.3.1
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -58,7 +58,7 @@
     setTimeout(() => obs.disconnect(), ms);
   };
 
-  // Surveille les events clavier + input sur un élément pendant N ms puis télécharge
+  // Surveille les events clavier + input sur un élément pendant N ms
   const watchKeys = (el, ms) => {
     if (!DEBUG) return;
     const onKd = (e) => dbg('KEYDOWN key=' + JSON.stringify(e.key) +
@@ -701,9 +701,9 @@
 
           if (usedDraftFiber) return;
 
-          // ── Stratégie B : selectAll → Delete → paste dans éditeur vide ───────
+          // ── Stratégie B : selectAll → beforeinput(insertText) ─────────────────
           // Twitch's paste handler fait toujours insertText (append) jamais replaceText.
-          // Workaround : vider l'éditeur avec Delete sur la sélection, puis coller.
+          // Draft.js traite avant tout le beforeinput avec sa SelectionState interne.
           editableEl.focus();
           snap('B_focus_done', editableEl);
           setTimeout(() => {
@@ -712,31 +712,59 @@
 
             // Draft.js traite selectionchange → SelectionState = "tout sélectionné"
             setTimeout(() => {
-              // Supprimer la sélection via keydown Delete (Draft.js gère cet event)
-              editableEl.dispatchEvent(new KeyboardEvent('keydown', {
-                key: 'Delete', code: 'Delete', bubbles: true, cancelable: true,
-              }));
-              snap('B3_apres_delete_kd', editableEl);
+              editableEl.focus();
+              snap('B3_avant_beforeinput', editableEl);
 
-              // Attendre que React re-render avec l'éditeur vide
+              let beforeInputHandled = false;
+              try {
+                const beforeEvt = new InputEvent('beforeinput', {
+                  bubbles: true,
+                  cancelable: true,
+                  inputType: 'insertText',
+                  data: corrected,
+                });
+                beforeInputHandled = !editableEl.dispatchEvent(beforeEvt);
+                snap('B4_beforeinput_handled=' + beforeInputHandled, editableEl);
+              } catch (err) {
+                dbg('beforeinput error: ' + err.message);
+              }
+
+              if (beforeInputHandled) {
+                setTimeout(() => {
+                  snap('B5_apres_beforeinput', editableEl);
+                  finalize();
+                }, 30);
+                return;
+              }
+
+              const execOk = document.execCommand('insertText', false, corrected);
+              snap('C_execCommand_ok=' + execOk, editableEl);
+              if (execOk) {
+                setTimeout(() => {
+                  snap('C2_apres_execCommand', editableEl);
+                  finalize();
+                }, 30);
+                return;
+              }
+
+              try {
+                const dt = new DataTransfer();
+                dt.setData('text/plain', corrected);
+                const pasteEvt = new ClipboardEvent('paste', {
+                  bubbles: true,
+                  cancelable: true,
+                  clipboardData: dt,
+                });
+                const pasteHandled = !editableEl.dispatchEvent(pasteEvt);
+                snap('D_paste_dispatched_handled=' + pasteHandled, editableEl);
+              } catch (err) {
+                dbg('paste error: ' + err.message);
+              }
+
               setTimeout(() => {
-                editableEl.focus();
-                snap('B4_avant_paste', editableEl);
-                try {
-                  const dt = new DataTransfer();
-                  dt.setData('text/plain', corrected);
-                  const pasteEvt = new ClipboardEvent('paste', {
-                    bubbles: true, cancelable: true, clipboardData: dt,
-                  });
-                  const handled = !editableEl.dispatchEvent(pasteEvt);
-                  snap('C_paste_dispatched_handled=' + handled, editableEl);
-                  if (!handled) {
-                    const ok = document.execCommand('insertText', false, corrected);
-                    snap('D_execCommand_ok=' + ok, editableEl);
-                  }
-                } catch (err) { dbg('paste error: ' + err.message); }
+                snap('E_apres_fallbacks', editableEl);
                 finalize();
-              }, 25);
+              }, 30);
             }, 25);
           }, 30);
           return;
