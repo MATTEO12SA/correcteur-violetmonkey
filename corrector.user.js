@@ -145,6 +145,7 @@
     lastApply:      null,   // données pour le bouton Annuler
     _selChangeTid:  null,
     _styleObserver: null,
+    _pillSelectionContext: null,
     correctionCache: new Map(),
 
     getDomSelectionContext() {
@@ -256,7 +257,7 @@
     _checkSelectionAndShowPill() {
       const context = this.getSelectionContext();
       if (!context) { this.hidePill(); return; }
-      this.showPill(context.rect);
+      this.showPill(context);
     },
 
     // Debounce : selectionchange se déclenche à chaque frappe sur toute la page
@@ -267,8 +268,10 @@
       }, 80);
     },
 
-    showPill(rect) {
+    showPill(context) {
       this.hidePill();
+      this._pillSelectionContext = context;
+      const { rect } = context;
       const pill = document.createElement('button');
       pill.className = 'corrector-pill';
       pill.setAttribute('aria-label', 'Corriger le texte sélectionné');
@@ -276,8 +279,15 @@
       pill.style.visibility = 'hidden';
       pill.style.left = '0px';
       pill.style.top = '0px';
-      pill.addEventListener('mousedown', (e) => e.preventDefault());
-      pill.addEventListener('click', () => this.triggerCorrection());
+      pill.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        if (e.button === 0) this.triggerCorrection(this._pillSelectionContext);
+      });
+      pill.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        this.triggerCorrection(this._pillSelectionContext);
+      });
       document.body.appendChild(pill);
 
       const pillRect = pill.getBoundingClientRect();
@@ -295,22 +305,29 @@
     },
 
     hidePill() {
+      this._pillSelectionContext = null;
       if (this.pill) { this.pill.remove(); this.pill = null; }
     },
 
-    triggerCorrection() {
-      const context = this.getSelectionContext();
-      if (!context) return;
+    triggerCorrection(context = null) {
+      const sourceContext = context || this.getSelectionContext() || this._pillSelectionContext;
+      if (!sourceContext) return;
 
-      this.selectedText = context.text;
-      this.selectedRawText = context.rawText;
+      const resolvedContext = {
+        ...sourceContext,
+        range: sourceContext.range ? sourceContext.range.cloneRange() : null,
+        rect: sourceContext.rect || (sourceContext.el ? sourceContext.el.getBoundingClientRect() : null),
+      };
+
+      this.selectedText = resolvedContext.text;
+      this.selectedRawText = resolvedContext.rawText;
       this.previousFocus = document.activeElement;
-      this.selectedRange = context.type === 'range' ? context.range : null;
-      this.savedInputSel = context.type === 'control'
-        ? { start: context.start, end: context.end }
+      this.selectedRange = resolvedContext.type === 'range' ? resolvedContext.range : null;
+      this.savedInputSel = resolvedContext.type === 'control'
+        ? { start: resolvedContext.start, end: resolvedContext.end }
         : null;
-      this.selectionPadding = context.padding;
-      this.selectionSource = context;
+      this.selectionPadding = resolvedContext.padding;
+      this.selectionSource = resolvedContext;
 
       const pillRect = this.pill ? this.pill.getBoundingClientRect() : null;
       const savedPos = this.loadPosition();
