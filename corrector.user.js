@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.2.1
+// @version        4.2.1.1
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
