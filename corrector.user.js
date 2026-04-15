@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.5.0
+// @version        4.5.1
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -171,6 +171,38 @@
     _styleObserver: null,
     _pillSelectionContext: null,
     correctionCache: new Map(),
+    _activeApplyToken: 0,
+    _applyTimeouts: new Set(),
+
+    beginApplyFlow() {
+      this.cancelPendingApplyFlow();
+      this._activeApplyToken += 1;
+      return this._activeApplyToken;
+    },
+
+    cancelPendingApplyFlow() {
+      this._activeApplyToken += 1;
+      this._applyTimeouts.forEach((timeoutId) => clearTimeout(timeoutId));
+      this._applyTimeouts.clear();
+    },
+
+    isApplyFlowActive(token) {
+      return token === this._activeApplyToken && !!this.menu;
+    },
+
+    scheduleApplyStep(token, callback, delay = 30) {
+      const timeoutId = setTimeout(() => {
+        this._applyTimeouts.delete(timeoutId);
+        if (!this.isApplyFlowActive(token)) return;
+        try {
+          callback();
+        } catch (error) {
+          console.error('[Correcteur] Apply flow error:', error);
+          this.showApplyError('Impossible de remplacer sur ce site. Utilisez "Copier".');
+        }
+      }, delay);
+      this._applyTimeouts.add(timeoutId);
+    },
 
     setDebugEnabled(enabled) {
       debugEnabled = !!enabled;
@@ -441,6 +473,10 @@
           if (res.status < 200 || res.status >= 300) { this.showCorrectionError(); return; }
           try {
             const matches = JSON.parse(res.responseText).matches || [];
+            if (this.correctionCache.size >= 50 && !this.correctionCache.has(cacheKey)) {
+              const oldestKey = this.correctionCache.keys().next().value;
+              if (oldestKey) this.correctionCache.delete(oldestKey);
+            }
             this.correctionCache.set(cacheKey, matches);
             this.renderCorrection(text, matches);
           }
@@ -492,20 +528,20 @@
       if (!this.menu) return;
 
       this.resetActionState();
-      const valid     = matches.filter(m => m.replacements && m.replacements.length > 0);
-      const corrected = this.applyMatches(text, valid);
+      const preparedMatches = this.prepareMatches(matches);
+      const corrected = this.applyMatches(text, preparedMatches);
 
       // Badge erreurs
-      if (valid.length > 0) {
+      if (preparedMatches.length > 0) {
         const badge = document.createElement('span');
         badge.className   = 'corrector-badge';
-        badge.textContent = valid.length + ' erreur' + (valid.length > 1 ? 's' : '');
+        badge.textContent = preparedMatches.length + ' erreur' + (preparedMatches.length > 1 ? 's' : '');
         this.menu.querySelector('.corrector-title').appendChild(badge);
       }
 
       // Texte original avec erreurs soulignées
       const origEl = this.menu.querySelector('.corrector-original-content');
-      origEl.replaceChildren(...this.buildSpans(text, valid, (m) => {
+      origEl.replaceChildren(...this.buildSpans(text, preparedMatches, (m) => {
         const s = document.createElement('span');
         s.className   = 'corrector-error';
         s.title       = m.message || '';
@@ -521,7 +557,7 @@
         ok.textContent = '\u2713 Aucune correction nécessaire';
         corrEl.replaceChildren(ok);
       } else {
-        corrEl.replaceChildren(...this.buildSpans(text, valid, (m) => {
+        corrEl.replaceChildren(...this.buildSpans(text, preparedMatches, (m) => {
           const s = document.createElement('span');
           s.className   = 'corrector-fix';
           s.textContent = m.replacements[0].value;
@@ -539,12 +575,26 @@
       }
     },
 
+    prepareMatches(matches) {
+      const sorted = (matches || [])
+        .filter((match) => match && match.replacements && match.replacements.length > 0)
+        .slice()
+        .sort((a, b) => a.offset - b.offset);
+
+      const prepared = [];
+      let cursor = 0;
+      for (const match of sorted) {
+        if (match.offset < cursor) continue;
+        prepared.push(match);
+        cursor = match.offset + match.length;
+      }
+      return prepared;
+    },
+
     buildSpans(text, matches, makeSpan) {
       const nodes  = [];
       let cursor   = 0;
-      const sorted = matches.slice().sort((a, b) => a.offset - b.offset);
-      for (const m of sorted) {
-        if (m.offset < cursor) continue; // ignore les matches qui chevauchent le précédent
+      for (const m of matches) {
         if (m.offset > cursor) nodes.push(document.createTextNode(text.slice(cursor, m.offset)));
         nodes.push(makeSpan(m));
         cursor = m.offset + m.length;
@@ -556,11 +606,9 @@
     applyMatches(text, matches) {
       if (!matches.length) return text;
       let r = text;
-      let boundary = text.length; // frontière basse : ne pas toucher ce qui a déjà été remplacé
-      for (const m of matches.slice().sort((a, b) => b.offset - a.offset)) {
-        if (m.offset + m.length > boundary) continue; // chevauche un remplacement précédent
+      for (let i = matches.length - 1; i >= 0; i--) {
+        const m = matches[i];
         r = r.slice(0, m.offset) + m.replacements[0].value + r.slice(m.offset + m.length);
-        boundary = m.offset;
       }
       return r;
     },
@@ -809,6 +857,7 @@
       }
 
       this.clearApplyError();
+      const applyToken = this.beginApplyFlow();
       const replacementText = this.getReplacementText(corrected);
 
       try {
@@ -857,6 +906,7 @@
           const safeWholeReplace = this.selectionMatchesWholeEditable(editableEl);
 
           const finalize = () => {
+            if (!this.isApplyFlowActive(applyToken)) return;
             this.lastApply = { type: 'contenteditable' };
             editableEl.focus();
             this.closeMenu();
@@ -865,6 +915,7 @@
           };
 
           const failEditableApply = () => {
+            if (!this.isApplyFlowActive(applyToken)) return;
             this.showApplyError(
               safeWholeReplace
                 ? 'Impossible de remplacer sur cet éditeur. Utilisez "Copier".'
@@ -874,7 +925,7 @@
 
           const performEditableInsert = (prefix, onNoChange) => {
             const finishAttempt = (label) => {
-              setTimeout(() => {
+              this.scheduleApplyStep(applyToken, () => {
                 snap(label, editableEl);
                 if ((editableEl.textContent || '') !== originalEditableText) {
                   finalize();
@@ -937,10 +988,10 @@
             }
             editableEl.focus();
             snap('C_focus_full', editableEl);
-            setTimeout(() => {
+            this.scheduleApplyStep(applyToken, () => {
               document.execCommand('selectAll');
               snap('C_selectAll_full', editableEl);
-              setTimeout(() => performEditableInsert('C_full'), 25);
+              this.scheduleApplyStep(applyToken, () => performEditableInsert('C_full'), 25);
             }, 30);
           };
 
@@ -983,38 +1034,12 @@
 
                   if (!draftProps) {
                     const inst = fiber.stateNode;
-                    if (inst && typeof inst === 'object' && !(inst instanceof Element)) {
-                      if (typeof inst.getEditorKey === 'function' &&
-                          inst.props && isES(inst.props.editorState) &&
-                          typeof inst.props.onChange === 'function') {
-                        dbg('fiber: DraftEditor stateNode at depth=' + depth);
-                        draftProps = { editorState: inst.props.editorState, onChange: inst.props.onChange };
-                      }
-                      if (!draftProps && inst.state && typeof inst.state === 'object') {
-                        for (const k of Object.keys(inst.state)) {
-                          if (isES(inst.state[k]) && typeof inst.setState === 'function') {
-                            dbg('fiber: stateNode.state["' + k + '"] at depth=' + depth);
-                            const sk = k;
-                            const si = inst;
-                            draftProps = { editorState: inst.state[k], onChange: (es) => si.setState({ [sk]: es }) };
-                            break;
-                          }
-                        }
-                      }
-                    }
-                  }
-
-                  if (!draftProps) {
-                    let hook = fiber.memoizedState;
-                    let hi = 0;
-                    while (hook && hi < 20) {
-                      if (isES(hook.memoizedState) && hook.queue?.dispatch) {
-                        dbg('fiber: hook[' + hi + '] at depth=' + depth);
-                        draftProps = { editorState: hook.memoizedState, onChange: hook.queue.dispatch };
-                        break;
-                      }
-                      hook = hook.next;
-                      hi++;
+                    if (inst && typeof inst === 'object' && !(inst instanceof Element) &&
+                        typeof inst.getEditorKey === 'function' &&
+                        inst.props && isES(inst.props.editorState) &&
+                        typeof inst.props.onChange === 'function') {
+                      dbg('fiber: DraftEditor stateNode at depth=' + depth);
+                      draftProps = { editorState: inst.props.editorState, onChange: inst.props.onChange };
                     }
                   }
 
@@ -1037,10 +1062,19 @@
                   const sel = editorState.getSelection ? editorState.getSelection() : editorState.get('selection');
                   const CS  = cs.constructor;
                   const ES  = editorState.constructor;
+                  const plainText = typeof cs?.getPlainText === 'function' ? cs.getPlainText('\n') : null;
+                  const sameText = plainText !== null &&
+                    normalizeComparableText(plainText) === normalizeComparableText(editableEl.textContent || '');
 
                   dbg('fiber: CS.createFromText=' + typeof CS.createFromText + ' ES.createWithContent=' + typeof ES.createWithContent);
 
-                  if (typeof CS.createFromText === 'function' && typeof ES.createWithContent === 'function') {
+                  if (
+                    sameText &&
+                    typeof sel?.merge === 'function' &&
+                    typeof CS.createFromText === 'function' &&
+                    typeof ES.createWithContent === 'function' &&
+                    typeof ES.forceSelection === 'function'
+                  ) {
                     const newContent = CS.createFromText(replacementText);
                     const lastBlk    = newContent.getLastBlock ? newContent.getLastBlock()
                                      : newContent.get('blockMap').last();
@@ -1054,7 +1088,10 @@
                     onChange(ES.forceSelection(ES.createWithContent(newContent), newSel));
                     snap('B_draft_content_replaced', editableEl);
                     usedDraftFiber = true;
-                    setTimeout(() => { editableEl.focus(); finalize(); }, 30);
+                    this.scheduleApplyStep(applyToken, () => {
+                      editableEl.focus();
+                      finalize();
+                    }, 30);
                   }
                 }
               }
@@ -1066,14 +1103,14 @@
           // ── Stratégie B : restaurer la vraie sélection puis beforeinput ────────
           editableEl.focus();
           snap('B_focus_done', editableEl);
-          setTimeout(() => {
+          this.scheduleApplyStep(applyToken, () => {
             const restored = this.restoreSavedRangeSelection();
             snap('B2_restore_selection=' + restored, editableEl);
             if (!restored) {
               runWholeEditorFallback();
               return;
             }
-            setTimeout(() => {
+            this.scheduleApplyStep(applyToken, () => {
               performEditableInsert('B_selection', safeWholeReplace ? runWholeEditorFallback : null);
             }, 25);
           }, 30);
@@ -1196,6 +1233,7 @@
 
     closeMenu() {
       if (this.currentRequest) { this.currentRequest.abort(); this.currentRequest = null; }
+      this.cancelPendingApplyFlow();
       if (this.menu) {
         if (typeof this.menu._dragCleanup === 'function') this.menu._dragCleanup();
         this.menu.remove();
