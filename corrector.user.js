@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.2.6
+// @version        4.2.7
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -569,44 +569,50 @@
             return;
           }
           editableEl.focus();
-          if (sel) { sel.removeAllRanges(); sel.addRange(this.selectedRange); }
-          snap('B_selection_restauree', editableEl);
+          snap('B_focus_done', editableEl);
           watchMutations(editableEl, 8000);
           watchKeys(editableEl, 8000);
 
-          // ── Stratégie 1 : paste simulé ──────────────────────────────────────
-          // On attend 50 ms pour que Draft.js traite le selectionchange émis par
-          // addRange() et synchronise son SelectionState interne AVANT le paste.
-          // Sans ce délai, Draft.js paste à la position du curseur (fin de texte)
-          // au lieu de remplacer la sélection → doublement du texte.
+          // ── Stratégie : selectAll → paste ───────────────────────────────────
+          // Draft.js utilise son SelectionState INTERNE pour le paste (pas window.getSelection).
+          // addRange() ne suffit pas : Draft.js override la sélection DOM via son onFocus.
+          // execCommand('selectAll') met à jour à la fois le DOM ET le SelectionState de Draft.js
+          // via le selectionchange qu'il émet, que Draft.js traite de façon native.
+          // Étape 1 : laisser Draft.js finir son cycle onFocus (~30 ms)
           setTimeout(() => {
-            snap('B2_avant_paste', editableEl);
-            let handled = false;
-            try {
-              const dt = new DataTransfer();
-              dt.setData('text/plain', corrected);
-              dt.setData('text/html',  corrected);
-              const pasteEvt = new ClipboardEvent('paste', {
-                bubbles: true, cancelable: true, clipboardData: dt,
-              });
-              handled = !editableEl.dispatchEvent(pasteEvt);
-              snap('C_paste_dispatched_handled=' + handled, editableEl);
-            } catch (err) {
-              dbg('paste dispatch error: ' + err.message);
-            }
+            document.execCommand('selectAll');
+            snap('B2_apres_selectAll', editableEl);
 
-            // ── Stratégie 2 : execCommand (fallback) ──────────────────────────
-            if (!handled) {
-              const execOk = document.execCommand('insertText', false, corrected);
-              snap('D_execCommand_ok=' + execOk, editableEl);
-            }
+            // Étape 2 : laisser Draft.js traiter le selectionchange de selectAll (~20 ms)
+            setTimeout(() => {
+              snap('B3_avant_paste', editableEl);
+              let handled = false;
+              try {
+                const dt = new DataTransfer();
+                dt.setData('text/plain', corrected);
+                // Pas de text/html : Draft.js parserait le HTML et casserait le texte brut
+                const pasteEvt = new ClipboardEvent('paste', {
+                  bubbles: true, cancelable: true, clipboardData: dt,
+                });
+                handled = !editableEl.dispatchEvent(pasteEvt);
+                snap('C_paste_dispatched_handled=' + handled, editableEl);
+              } catch (err) {
+                dbg('paste dispatch error: ' + err.message);
+              }
 
-            this.lastApply = { type: 'contenteditable' };
-            editableEl.focus();
-            this.closeMenu();
-            snap('E_apres_closeMenu', editableEl);
-            this.showConfirmation(false);
-          }, 50);
+              // ── Fallback execCommand ─────────────────────────────────────────
+              if (!handled) {
+                const execOk = document.execCommand('insertText', false, corrected);
+                snap('D_execCommand_ok=' + execOk, editableEl);
+              }
+
+              this.lastApply = { type: 'contenteditable' };
+              editableEl.focus();
+              this.closeMenu();
+              snap('E_apres_closeMenu', editableEl);
+              this.showConfirmation(false);
+            }, 20);
+          }, 30);
           return;
         }
 
