@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.2.3
+// @version        4.2.4
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -79,11 +79,10 @@
     el.addEventListener('beforeinput',         onInput);
     document.addEventListener('selectionchange', onSel);
     setTimeout(() => {
-      document.removeEventListener('keydown',        onKd);
-      el.removeEventListener('input',                onInput);
-      el.removeEventListener('beforeinput',          onInput);
-      document.removeEventListener('selectionchange', onSel);
-      downloadLogs();
+      document.removeEventListener('keydown',          onKd);
+      el.removeEventListener('input',                  onInput);
+      el.removeEventListener('beforeinput',            onInput);
+      document.removeEventListener('selectionchange',  onSel);
     }, ms);
   };
 
