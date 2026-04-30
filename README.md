@@ -31,6 +31,8 @@ Une fenêtre d'installation apparaît → clique **Confirmer**.
 4. Attends la correction (quelques secondes)
 5. Clique **Appliquer** pour remplacer le texte dans la page, ou **Copier** pour copier la version corrigée
 
+Utilise **Copier** si la page refuse le remplacement automatique, notamment dans certains éditeurs web complexes ou champs contrôlés par React.
+
 ### Raccourcis
 | Action | Comment |
 |--------|---------|
@@ -57,14 +59,37 @@ Pour forcer une mise à jour manuelle :
 - Détection automatique de la langue
 - Diff visuel : erreurs soulignées en rouge, corrections surlignées en vert
 - Modes de correction `Chat`, `Équilibré` et `Strict` via l'engrenage
+- Mode `Strict` avec niveau LanguageTool `picky`, modes `Chat` et `Équilibré` en niveau standard
 - Filtrage intelligent des suggestions trop agressives sur les messages courts et le chat
 - Protection des `@mentions`, `#hashtags`, URLs, emails et blocs inline sensibles
+- Gestion claire des limites API, timeouts et erreurs réseau
 - Panneau déplaçable, position mémorisée entre les sessions
 - Compatible avec les SPA (Facebook, Instagram, Twitter…)
+- Interface isolée en Shadow DOM pour éviter les conflits CSS avec les sites visités
+- Panneau responsive sur petits écrans
 - Dark mode automatique
-- Navigation clavier complète (accessibilité)
+- Navigation clavier complète, focus visible et rôles ARIA utiles
+- États visuels dédiés : chargement, succès, aucune correction, limite API, timeout, réseau et remplacement impossible
 - Paramètres rapides via l'engrenage du panneau
 - Fonctionne sur tous les sites (`*://*/*`)
+
+## API et confidentialité
+
+Le script utilise l'endpoint public documenté de LanguageTool :
+
+```
+https://api.languagetool.org/v2/check
+```
+
+Quand tu cliques **Corriger**, le texte sélectionné est envoyé à LanguageTool pour analyse. Le script ajoute `preferredVariants=fr-FR,en-US,de-DE,pt-PT` afin d'améliorer la détection automatique des variantes de langue.
+
+Limites importantes du service gratuit :
+
+- environ 20 requêtes par minute par IP ;
+- environ 75 KB de texte par minute ;
+- environ 20 KB par requête.
+
+Le script bloque donc les sélections trop longues avant l'appel API et affiche un message clair en cas de limite, timeout ou erreur réseau.
 
 ## Debug local
 
@@ -86,10 +111,19 @@ localStorage.setItem('__corrector_debug', '1');
 localStorage.removeItem('__corrector_debug');
 ```
 
+### Vérification du code
+
+Le projet n'a aucune dépendance à installer. Les commandes disponibles sont :
+
+```bash
+npm run check
+npm test
+```
+
 ---
 
 ## Technologies
 
 - JavaScript vanilla
-- [LanguageTool API](https://languagetool.org/http-api/) (gratuit, sans clé API)
+- [LanguageTool API publique](https://dev.languagetool.org/public-http-api.html) (gratuit, sans clé API)
 - Violetmonkey `GM_xmlhttpRequest` (contourne le CSP des sites)
