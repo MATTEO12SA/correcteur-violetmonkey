@@ -57,11 +57,14 @@ Pour forcer une mise à jour manuelle :
 ## Fonctionnalités
 
 - Détection automatique de la langue
+- Utilise le `lang` de la page quand il est disponible pour éviter une détection serveur inutile
 - Diff visuel : erreurs soulignées en rouge, corrections surlignées en vert
 - Modes de correction `Chat`, `Équilibré` et `Strict` via l'engrenage
 - Mode `Strict` avec niveau LanguageTool `picky`, modes `Chat` et `Équilibré` en niveau standard
+- Filtrage serveur des catégories trop agressives en modes `Chat` et `Équilibré`
 - Filtrage intelligent des suggestions trop agressives sur les messages courts et le chat
 - Protection des `@mentions`, `#hashtags`, URLs, emails et blocs inline sensibles
+- Cache persistant des corrections récentes pour accélérer les textes déjà corrigés
 - Gestion claire des limites API, timeouts et erreurs réseau
 - Panneau déplaçable, position mémorisée entre les sessions
 - Compatible avec les SPA (Facebook, Instagram, Twitter…)
@@ -90,6 +93,12 @@ Limites importantes du service gratuit :
 - environ 20 KB par requête.
 
 Le script bloque donc les sélections trop longues avant l'appel API et affiche un message clair en cas de limite, timeout ou erreur réseau.
+
+## Cache persistant
+
+Les corrections LanguageTool sont conservées localement pendant 7 jours via le stockage Violetmonkey (`GM_setValue` / `GM_getValue`). La clé de cache utilise le site, le mode de correction, le profil du texte, sa longueur et un hash FNV-1a du contenu, ce qui évite de stocker le texte complet dans les clés.
+
+Le cache est limité à 200 entrées récentes. Il sert uniquement à réafficher instantanément une correction déjà obtenue pour le même texte et le même mode.
 
 ## Debug local
 

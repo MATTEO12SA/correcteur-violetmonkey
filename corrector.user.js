@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.9.0
+// @version        4.10.0
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -9,6 +9,9 @@
 // @updateURL      https://raw.githubusercontent.com/MATTEO12SA/correcteur-violetmonkey/main/corrector.user.js
 // @downloadURL    https://raw.githubusercontent.com/MATTEO12SA/correcteur-violetmonkey/main/corrector.user.js
 // @grant          GM_xmlhttpRequest
+// @grant          GM_setValue
+// @grant          GM_getValue
+// @grant          GM_deleteValue
 // @connect        api.languagetool.org
 // @run-at         document-end
 // ==/UserScript==
@@ -106,11 +109,24 @@
 
   const debounce = (fn, ms) => {
     let tid = null;
-    const wrapper = (...args) => {
-      clearTimeout(tid);
-      tid = setTimeout(() => fn(...args), ms);
+    let lastArgs = null;
+    const invoke = () => {
+      const args = lastArgs || [];
+      tid = null;
+      lastArgs = null;
+      fn(...args);
     };
-    wrapper.cancel = () => { clearTimeout(tid); tid = null; };
+    const wrapper = (...args) => {
+      lastArgs = args;
+      clearTimeout(tid);
+      tid = setTimeout(invoke, ms);
+    };
+    wrapper.flush = () => {
+      if (!tid) return;
+      clearTimeout(tid);
+      invoke();
+    };
+    wrapper.cancel = () => { clearTimeout(tid); tid = null; lastArgs = null; };
     return wrapper;
   };
 
@@ -137,14 +153,55 @@
     return wrapper;
   };
 
-  const CORRECTION_CACHE_MAX = 50;
-  const CORRECTION_CACHE_TTL_MS = 10 * 60 * 1000;
+  const PERSIST_CACHE_KEY = '__corrector_v4_cache';
+  const CORRECTION_CACHE_MAX = 200;
+  const CORRECTION_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+  const hashFNV1a = (str) => {
+    const source = String(str || '');
+    let h = 0x811c9dc5;
+    for (let i = 0; i < source.length; i++) {
+      h ^= source.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(36);
+  };
+
+  const persistCacheLoad = () => {
+    if (typeof GM_getValue !== 'function') return new Map();
+    try {
+      const data = GM_getValue(PERSIST_CACHE_KEY, '[]');
+      const arr = JSON.parse(data);
+      if (!Array.isArray(arr)) return new Map();
+      const now = Date.now();
+      const cache = new Map();
+      for (const item of arr) {
+        if (!Array.isArray(item) || item.length !== 2) continue;
+        const [key, entry] = item;
+        if (typeof key !== 'string' || !entry || typeof entry.t !== 'number') continue;
+        if (now - entry.t > CORRECTION_CACHE_TTL_MS) continue;
+        cache.set(key, entry);
+      }
+      return cache;
+    } catch (_) {
+      return new Map();
+    }
+  };
+
+  const persistCacheSave = debounce((cache) => {
+    if (typeof GM_setValue !== 'function') return;
+    try {
+      const arr = Array.from(cache.entries()).slice(-CORRECTION_CACHE_MAX);
+      GM_setValue(PERSIST_CACHE_KEY, JSON.stringify(arr));
+    } catch (_) {}
+  }, 1000);
 
   const lruCacheGet = (cache, key) => {
     if (!cache.has(key)) return null;
     const entry = cache.get(key);
     if (Date.now() - entry.t > CORRECTION_CACHE_TTL_MS) {
       cache.delete(key);
+      persistCacheSave(cache);
       return null;
     }
     cache.delete(key);
@@ -159,6 +216,7 @@
       const oldest = cache.keys().next().value;
       cache.delete(oldest);
     }
+    persistCacheSave(cache);
   };
 
   const copyTextToClipboard = async (text) => {
@@ -369,7 +427,8 @@
     _selChangeTid:  null,
     _styleObserver: null,
     _pillSelectionContext: null,
-    correctionCache: new Map(),
+    correctionCache: persistCacheLoad(),
+    _contextCache: new Map(),
     _correctionRequestToken: 0,
     _languageToolCooldownUntil: 0,
     _lt_requestTimestamps: [],
@@ -658,6 +717,7 @@
     },
 
     destroy() {
+      persistCacheSave.flush?.();
       this.closeMenu();
       this.hidePill();
       this._throttledScroll?.cancel();
@@ -827,13 +887,25 @@
     // ─────────────────────────────────────────────
     createCorrectionContext(text) {
       const host = (window.location.hostname || '').toLowerCase();
+      const source = text || '';
+      const language = this.detectLanguageHint() || 'auto';
+      const key = `${host}||${correctionMode}||${language}||${source.length}||${hashFNV1a(source)}`;
+      if (this._contextCache.has(key)) return this._contextCache.get(key);
+
       const analysis = this.analyzeSelectionText(text, host);
-      return {
+      const context = {
         host,
         mode: correctionMode,
+        language,
         profile: analysis.profile,
         protectedRanges: analysis.protectedRanges,
+        flavor: analysis.profile.chatLike ? 'chat' : 'prose',
       };
+      if (this._contextCache.size > 32) {
+        this._contextCache.delete(this._contextCache.keys().next().value);
+      }
+      this._contextCache.set(key, context);
+      return context;
     },
 
     analyzeSelectionText(text, host) {
@@ -873,8 +945,8 @@
     },
 
     buildCorrectionCacheKey(text, context) {
-      const flavor = context.profile.chatLike ? 'chat' : 'prose';
-      return [context.host, context.mode, flavor, text].join('||');
+      const flavor = context.flavor || (context.profile.chatLike ? 'chat' : 'prose');
+      return [context.host, context.mode, context.language || 'auto', flavor, (text || '').length, hashFNV1a(text)].join('||');
     },
 
     mergeProtectedRanges(ranges) {
@@ -1064,8 +1136,8 @@
       return score;
     },
 
-    shouldKeepMatch(matchInfo, replacementValue, context) {
-      if (!matchInfo || !replacementValue) return false;
+    shouldKeepMatchInfo(matchInfo, context) {
+      if (!matchInfo) return false;
 
       const { offset: start, length, issueType, categoryId, ruleId, original } = matchInfo;
       const end = start + length;
@@ -1077,12 +1149,26 @@
       }
       if (context.mode === 'chat-lite') {
         if (issueType === 'duplication' && original.trim().length <= 2) return false;
-        if (issueType === 'whitespace' && !/\s{2,}/.test(original) && !/[,:;!?]/.test(replacementValue)) return false;
-        if (categoryId.includes('PUNCTUATION') && replacementValue.length > original.length + 3 && !/[.!?]/.test(original)) return false;
       }
       if (context.profile.codeish && context.mode !== 'strict' && /[\\/]|(?:^|_)[A-Z0-9_]+(?:$|_)/.test(original)) return false;
       if (ruleId.includes('TYPOGRAF') && context.mode === 'chat-lite' && context.profile.chatLike) return false;
       return true;
+    },
+
+    shouldKeepMatchFinal(matchInfo, replacementValue, context) {
+      if (!matchInfo || !replacementValue) return false;
+
+      const { issueType, categoryId, original } = matchInfo;
+      if (context.mode === 'chat-lite') {
+        if (issueType === 'whitespace' && !/\s{2,}/.test(original) && !/[,:;!?]/.test(replacementValue)) return false;
+        if (categoryId.includes('PUNCTUATION') && replacementValue.length > original.length + 3 && !/[.!?]/.test(original)) return false;
+      }
+      return true;
+    },
+
+    shouldKeepMatch(matchInfo, replacementValue, context) {
+      return this.shouldKeepMatchInfo(matchInfo, context) &&
+        this.shouldKeepMatchFinal(matchInfo, replacementValue, context);
     },
 
     getTextLimitError(text) {
@@ -1115,13 +1201,50 @@
       this._lt_requestTimestamps.push(Date.now());
     },
 
+    detectLanguageHint() {
+      const rawLang = (document.documentElement?.lang || '').toLowerCase().replace('_', '-');
+      const exactMap = {
+        'en-us': 'en-US',
+        'en-gb': 'en-GB',
+        'en-ca': 'en-CA',
+        'en-au': 'en-AU',
+        'en-nz': 'en-NZ',
+        'en-za': 'en-ZA',
+        'de-de': 'de-DE',
+        'de-at': 'de-AT',
+        'de-ch': 'de-CH',
+        'pt-pt': 'pt-PT',
+        'pt-br': 'pt-BR',
+      };
+      if (exactMap[rawLang]) return exactMap[rawLang];
+      const lang = rawLang.split('-')[0];
+      const map = {
+        fr: 'fr',
+        en: 'en-US',
+        de: 'de-DE',
+        pt: 'pt-PT',
+        es: 'es',
+        it: 'it',
+        nl: 'nl',
+        pl: 'pl',
+      };
+      return map[lang] || null;
+    },
+
     buildLanguageToolPayload(text, context) {
-      return new URLSearchParams({
+      const params = new URLSearchParams({
         text,
-        language: 'auto',
+        language: context.language || this.detectLanguageHint() || 'auto',
         preferredVariants: LANGUAGETOOL_PREFERRED_VARIANTS,
         level: context.mode === 'strict' ? 'picky' : 'default',
-      }).toString();
+      });
+
+      if (context.mode === 'chat-lite') {
+        params.set('disabledCategories', 'STYLE,REDUNDANCY,COLLOQUIALISMS,TYPOGRAPHY');
+      } else if (context.mode === 'balanced') {
+        params.set('disabledCategories', 'STYLE,REDUNDANCY');
+      }
+      return params.toString();
     },
 
     getLanguageToolErrorMessage(status) {
@@ -1171,7 +1294,10 @@
       this.currentRequest = GM_xmlhttpRequest({
         method:  'POST',
         url:     LANGUAGETOOL_ENDPOINT,
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Accept': 'application/json',
+        },
         data:    this.buildLanguageToolPayload(text, correctionContext),
         timeout: LANGUAGETOOL_TIMEOUT_MS,
 
@@ -1353,8 +1479,9 @@
         .filter((match) => match && Array.isArray(match.replacements) && match.replacements.length > 0)
         .map((match) => {
           const matchInfo = this.createMatchInfo(match, text);
+          if (!this.shouldKeepMatchInfo(matchInfo, correctionContext)) return null;
           const replacementValue = this.pickReplacement(matchInfo, text, correctionContext);
-          if (!this.shouldKeepMatch(matchInfo, replacementValue, correctionContext)) return null;
+          if (!this.shouldKeepMatchFinal(matchInfo, replacementValue, correctionContext)) return null;
           return {
             ...matchInfo.match,
             replacementValue,
@@ -1394,13 +1521,18 @@
     },
 
     applyMatches(text, matches) {
-      if (!matches.length) return text;
-      let r = text;
-      for (let i = matches.length - 1; i >= 0; i--) {
-        const m = matches[i];
-        r = r.slice(0, m.offset) + m.replacementValue + r.slice(m.offset + m.length);
+      if (!matches || !matches.length) return text;
+      const sorted = matches.slice().sort((a, b) => a.offset - b.offset);
+      const parts = [];
+      let cursor = 0;
+      for (const m of sorted) {
+        if (m.offset < cursor) continue;
+        if (m.offset > cursor) parts.push(text.slice(cursor, m.offset));
+        parts.push(String(m.replacementValue ?? ''));
+        cursor = m.offset + m.length;
       }
-      return r;
+      if (cursor < text.length) parts.push(text.slice(cursor));
+      return parts.join('');
     },
 
     // Vérifie que la range sauvegardée pointe toujours vers le bon texte dans le DOM
