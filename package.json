@@ -1,6 +1,6 @@
 {
   "name": "correcteur-violetmonkey",
-  "version": "4.8.0",
+  "version": "4.9.0",
   "private": true,
   "scripts": {
     "check": "node --check corrector.user.js",

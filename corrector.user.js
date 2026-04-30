@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
 // @namespace      http://violetmonkey.net/
-// @version        4.8.0
+// @version        4.9.0
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
 // @match          *://*/*
@@ -23,7 +23,8 @@
   const UI_ROOT_ID = '__corrector_violetmonkey_root';
   const NAV_EVENT = '_corrector_nav';
   const HISTORY_PATCH_FLAG = '__corrector_history_patched';
-  const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url', 'tel', 'email', 'password']);
+  // 'password' volontairement exclu : envoyer un mot de passe à LanguageTool serait une fuite de credential.
+  const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url', 'tel', 'email']);
   const CORRECTION_MODES = new Set(['chat-lite', 'balanced', 'strict']);
   const DEFAULT_CORRECTION_MODE = 'balanced';
   const HOST_CHAT_REGEX = /(?:^|\.)(?:twitch|kick|discord|slack|telegram|messenger|teams|irccloud|chat)\./i;
@@ -86,6 +87,78 @@
   const formatByteSize = (bytes) => {
     if (bytes >= 1024) return `${Math.ceil(bytes / 1024)} Ko`;
     return `${bytes} octets`;
+  };
+
+  // Caractères Unicode dangereux dans les replacements LanguageTool :
+  // U+200B-U+200F : zero-width / marks (texte invisible)
+  // U+202A-U+202E : RTL/LTR overrides (peuvent inverser visuellement le texte)
+  // U+2066-U+2069 : isolates bidi
+  // U+FEFF : BOM
+  const DANGEROUS_UNICODE_REGEX = /[​-\u200F\u202A-\u202E\u2066-\u2069﻿]/;
+  const ZALGO_COMBINER_REGEX = /[̀-ͯ]{4,}/;
+
+  const isSafeReplacement = (val) => {
+    if (typeof val !== 'string') return false;
+    if (DANGEROUS_UNICODE_REGEX.test(val)) return false;
+    if (ZALGO_COMBINER_REGEX.test(val)) return false;
+    return true;
+  };
+
+  const debounce = (fn, ms) => {
+    let tid = null;
+    const wrapper = (...args) => {
+      clearTimeout(tid);
+      tid = setTimeout(() => fn(...args), ms);
+    };
+    wrapper.cancel = () => { clearTimeout(tid); tid = null; };
+    return wrapper;
+  };
+
+  const throttle = (fn, ms) => {
+    let last = 0;
+    let pending = null;
+    const wrapper = (...args) => {
+      const now = Date.now();
+      const remaining = ms - (now - last);
+      if (remaining <= 0) {
+        clearTimeout(pending);
+        pending = null;
+        last = now;
+        fn(...args);
+      } else if (!pending) {
+        pending = setTimeout(() => {
+          last = Date.now();
+          pending = null;
+          fn(...args);
+        }, remaining);
+      }
+    };
+    wrapper.cancel = () => { clearTimeout(pending); pending = null; };
+    return wrapper;
+  };
+
+  const CORRECTION_CACHE_MAX = 50;
+  const CORRECTION_CACHE_TTL_MS = 10 * 60 * 1000;
+
+  const lruCacheGet = (cache, key) => {
+    if (!cache.has(key)) return null;
+    const entry = cache.get(key);
+    if (Date.now() - entry.t > CORRECTION_CACHE_TTL_MS) {
+      cache.delete(key);
+      return null;
+    }
+    cache.delete(key);
+    cache.set(key, entry);
+    return entry.v;
+  };
+
+  const lruCacheSet = (cache, key, value) => {
+    if (cache.has(key)) cache.delete(key);
+    cache.set(key, { v: value, t: Date.now() });
+    while (cache.size > CORRECTION_CACHE_MAX) {
+      const oldest = cache.keys().next().value;
+      cache.delete(oldest);
+    }
   };
 
   const copyTextToClipboard = async (text) => {
@@ -299,6 +372,7 @@
     correctionCache: new Map(),
     _correctionRequestToken: 0,
     _languageToolCooldownUntil: 0,
+    _lt_requestTimestamps: [],
     _activeApplyToken: 0,
     _applyTimeouts: new Set(),
 
@@ -506,6 +580,7 @@
         .filter((el) => {
           if (!(el instanceof HTMLElement)) return false;
           if (el.hidden || el.getAttribute('aria-hidden') === 'true') return false;
+          if (el.getAttribute('aria-disabled') === 'true') return false;
           return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
         });
     },
@@ -561,14 +636,38 @@
     // Init
     // ─────────────────────────────────────────────
     init() {
-      document.addEventListener('mouseup',         (e) => this.handleMouseUp(e));
-      document.addEventListener('keyup',           (e) => this.handleKeyUp(e));
-      document.addEventListener('selectionchange', ()  => this.handleSelectionChange());
-      document.addEventListener('click',           (e) => this.handleOutsideClick(e));
-      document.addEventListener('keydown',         (e) => this.handleKeyDown(e));
-      window.addEventListener('beforeunload',      ()  => this.closeMenu());
+      this._boundListeners = [];
+      const bind = (target, evt, handler, opts) => {
+        target.addEventListener(evt, handler, opts);
+        this._boundListeners.push({ target, evt, handler, opts });
+      };
+
+      this._throttledScroll = throttle(() => this.handlePillScroll(), 100);
+
+      bind(document, 'mouseup',         (e) => this.handleMouseUp(e));
+      bind(document, 'keyup',           (e) => this.handleKeyUp(e));
+      bind(document, 'selectionchange', ()  => this.handleSelectionChange());
+      bind(document, 'click',           (e) => this.handleOutsideClick(e));
+      bind(document, 'keydown',         (e) => this.handleKeyDown(e));
+      bind(window,   'beforeunload',    ()  => this.destroy());
+      bind(window,   'scroll',          this._throttledScroll, { passive: true, capture: true });
+      bind(window,   'resize',          this._throttledScroll, { passive: true });
+
       this.ensureUiRoot();
       this.watchNavigation();
+    },
+
+    destroy() {
+      this.closeMenu();
+      this.hidePill();
+      this._throttledScroll?.cancel();
+      for (const { target, evt, handler, opts } of (this._boundListeners || [])) {
+        target.removeEventListener(evt, handler, opts);
+      }
+      this._boundListeners = [];
+      this._styleObserver?.disconnect();
+      this._styleObserver = null;
+      this.abortCurrentRequest();
     },
 
     // ─────────────────────────────────────────────
@@ -631,7 +730,7 @@
       clearTimeout(this._selChangeTid);
       this._selChangeTid = setTimeout(() => {
         if (!this.getSelectionContext()) this.hidePill();
-      }, 80);
+      }, 40);
     },
 
     showPill(context) {
@@ -656,6 +755,13 @@
       });
       this.ensureUiRoot().appendChild(pill);
 
+      this.positionPill(pill, rect);
+      pill.style.visibility = 'visible';
+      this.pill = pill;
+    },
+
+    positionPill(pill, rect) {
+      if (!pill || !rect) return;
       const pillRect = pill.getBoundingClientRect();
       const gap = 8;
       let x = rect.left + rect.width / 2 - pillRect.width / 2;
@@ -663,11 +769,21 @@
       if (y < 8) y = rect.bottom + gap;
       x = Math.max(8, Math.min(x, window.innerWidth - pillRect.width - 8));
       y = Math.max(8, Math.min(y, window.innerHeight - pillRect.height - 8));
-
       pill.style.left = `${x}px`;
       pill.style.top = `${y}px`;
-      pill.style.visibility = 'visible';
-      this.pill = pill;
+    },
+
+    handlePillScroll() {
+      if (!this.pill || !this._pillSelectionContext) return;
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) { this.hidePill(); return; }
+      try {
+        const rect = sel.getRangeAt(0).getBoundingClientRect();
+        if (!rect || (rect.width === 0 && rect.height === 0)) { this.hidePill(); return; }
+        if (rect.bottom < 0 || rect.top > window.innerHeight) { this.hidePill(); return; }
+        this._pillSelectionContext = { ...this._pillSelectionContext, rect };
+        this.positionPill(this.pill, rect);
+      } catch (_) { this.hidePill(); }
     },
 
     hidePill() {
@@ -909,12 +1025,12 @@
       const candidates = [];
       const seenCandidates = new Set();
       for (const replacement of (match.replacements || []).slice(0, 5)) {
-        const value = replacement && typeof replacement.value === 'string'
+        const raw = replacement && typeof replacement.value === 'string'
           ? replacement.value.replace(/\u00A0/g, ' ')
           : '';
-        if (!value || seenCandidates.has(value)) continue;
-        seenCandidates.add(value);
-        candidates.push(value);
+        if (!raw || !isSafeReplacement(raw) || seenCandidates.has(raw)) continue;
+        seenCandidates.add(raw);
+        candidates.push(raw);
       }
 
       let best = null;
@@ -989,6 +1105,16 @@
       this._languageToolCooldownUntil = Date.now() + LANGUAGETOOL_RATE_LIMIT_COOLDOWN_MS;
     },
 
+    canMakeLanguageToolRequest() {
+      const now = Date.now();
+      this._lt_requestTimestamps = this._lt_requestTimestamps.filter(t => now - t < 60000);
+      return this._lt_requestTimestamps.length < 20;
+    },
+
+    recordLanguageToolRequest() {
+      this._lt_requestTimestamps.push(Date.now());
+    },
+
     buildLanguageToolPayload(text, context) {
       return new URLSearchParams({
         text,
@@ -1019,8 +1145,9 @@
       }
 
       const cacheKey = this.buildCorrectionCacheKey(text, correctionContext);
-      if (this.correctionCache.has(cacheKey)) {
-        this.renderCorrection(text, this.correctionCache.get(cacheKey), correctionContext);
+      const cached = lruCacheGet(this.correctionCache, cacheKey);
+      if (cached) {
+        this.renderCorrection(text, cached, correctionContext);
         return;
       }
 
@@ -1029,6 +1156,15 @@
         this.showCorrectionError(cooldownError, { retry: false, kind: 'rate-limit' });
         return;
       }
+
+      if (!this.canMakeLanguageToolRequest()) {
+        this.showCorrectionError(
+          'Limite locale atteinte (20 req/min). Patientez quelques secondes.',
+          { retry: false, kind: 'rate-limit' }
+        );
+        return;
+      }
+      this.recordLanguageToolRequest();
 
       this.setLoadingState(true);
 
@@ -1052,12 +1188,13 @@
             return;
           }
           try {
-            const matches = JSON.parse(res.responseText).matches || [];
-            if (this.correctionCache.size >= 50 && !this.correctionCache.has(cacheKey)) {
-              const oldestKey = this.correctionCache.keys().next().value;
-              if (oldestKey) this.correctionCache.delete(oldestKey);
+            const ctype = (res.responseHeaders || '').toLowerCase();
+            if (ctype && !ctype.includes('application/json')) {
+              this.showCorrectionError(USER_MESSAGES.invalidResponse, { kind: 'error' });
+              return;
             }
-            this.correctionCache.set(cacheKey, matches);
+            const matches = JSON.parse(res.responseText).matches || [];
+            lruCacheSet(this.correctionCache, cacheKey, matches);
             this.renderCorrection(text, matches, correctionContext);
           }
           catch (_) { this.showCorrectionError(USER_MESSAGES.invalidResponse, { kind: 'error' }); }
@@ -1289,7 +1426,13 @@
       if (!refs) return;
       this.clearApplyError();
 
-      refs.title?.querySelectorAll('.corrector-badge').forEach((badge) => badge.remove());
+      const badges = refs.title?.querySelectorAll('.corrector-badge');
+      if (badges && badges.length) {
+        const range = document.createRange();
+        range.setStartBefore(badges[0]);
+        range.setEndAfter(badges[badges.length - 1]);
+        range.deleteContents();
+      }
 
       const applyBtn = refs.applyBtn;
       if (applyBtn) {
@@ -1330,10 +1473,17 @@
       if (!this.selectedRange) return false;
       const sel = window.getSelection();
       if (!sel) return false;
-      const range = this.selectedRange.cloneRange();
-      sel.removeAllRanges();
-      sel.addRange(range);
-      return sel.toString() === this.selectedRawText;
+      try {
+        const sc = this.selectedRange.startContainer;
+        const ec = this.selectedRange.endContainer;
+        if (!sc?.isConnected || !ec?.isConnected) return false;
+        const range = this.selectedRange.cloneRange();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        return normalizeComparableText(sel.toString()) === normalizeComparableText(this.selectedRawText);
+      } catch (_) {
+        return false;
+      }
     },
 
     // ─────────────────────────────────────────────
@@ -1463,39 +1613,62 @@
       const header = this.getMenuRefs()?.header || menu.querySelector('.corrector-header');
       let startX, startY, startLeft, startTop;
 
+      const getPoint = (e) => {
+        if (e.touches && e.touches[0]) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        if (e.changedTouches && e.changedTouches[0]) return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+        return { x: e.clientX, y: e.clientY };
+      };
+
       const onMove = (e) => {
-        const dx = e.clientX - startX;
-        const dy = e.clientY - startY;
+        const { x, y } = getPoint(e);
+        const dx = x - startX;
+        const dy = y - startY;
         const newLeft = Math.max(0, Math.min(startLeft + dx, window.innerWidth  - menu.offsetWidth));
         const newTop  = Math.max(0, Math.min(startTop  + dy, window.innerHeight - menu.offsetHeight));
         menu.style.left = newLeft + 'px';
         menu.style.top  = newTop  + 'px';
+        if (e.cancelable) e.preventDefault();
+      };
+
+      const detach = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup',   onUp);
+        document.removeEventListener('touchmove', onMove);
+        document.removeEventListener('touchend',  onUp);
+        document.removeEventListener('touchcancel', onUp);
       };
 
       const onUp = () => {
-        document.removeEventListener('mousemove', onMove);
-        document.removeEventListener('mouseup',   onUp);
+        detach();
         menu.classList.remove('corrector-dragging');
         this.savePosition(parseInt(menu.style.left), parseInt(menu.style.top));
       };
 
       // Nettoyage si le menu est fermé pendant un drag (évite des listeners fantômes)
-      menu._dragCleanup = () => {
-        document.removeEventListener('mousemove', onMove);
-        document.removeEventListener('mouseup',   onUp);
-      };
+      menu._dragCleanup = detach;
 
-      header.addEventListener('mousedown', (e) => {
+      const onStart = (e) => {
         if (e.target.closest('.corrector-close-btn') || e.target.closest('.corrector-settings-btn')) return;
-        e.preventDefault();
-        startX    = e.clientX;
-        startY    = e.clientY;
+        if (e.touches && e.touches.length > 1) return;
+        if (e.cancelable) e.preventDefault();
+        const { x, y } = getPoint(e);
+        startX    = x;
+        startY    = y;
         startLeft = parseInt(menu.style.left) || 0;
         startTop  = parseInt(menu.style.top)  || 0;
         menu.classList.add('corrector-dragging');
-        document.addEventListener('mousemove', onMove);
-        document.addEventListener('mouseup',   onUp);
-      });
+        if (e.touches) {
+          document.addEventListener('touchmove', onMove, { passive: false });
+          document.addEventListener('touchend',  onUp);
+          document.addEventListener('touchcancel', onUp);
+        } else {
+          document.addEventListener('mousemove', onMove);
+          document.addEventListener('mouseup',   onUp);
+        }
+      };
+
+      header.addEventListener('mousedown', onStart);
+      header.addEventListener('touchstart', onStart, { passive: false });
     },
 
     savePosition(x, y) {
@@ -1546,8 +1719,11 @@
     tryDraftReactWholeEditorReplacement(editableEl, replacementText, originalEditableText, applyToken, finalize, onNoChange) {
       try {
         const allKeys = Object.getOwnPropertyNames(editableEl);
+        // React 16 : __reactInternalInstance$, React 17/18 : __reactFiber$ + __reactProps$.
         const rKey = allKeys.find(k =>
-          k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
+          k.startsWith('__reactFiber') ||
+          k.startsWith('__reactInternalInstance') ||
+          k.startsWith('__reactProps')
         );
         dbg('fiber: rKey=' + (rKey ? rKey.slice(0, 30) : 'null'));
         if (!rKey) return false;
@@ -1558,6 +1734,12 @@
         );
 
         let fiber = editableEl[rKey];
+        // Si on a attrapé __reactProps, retrouver le Fiber sibling (où vivent memoizedProps).
+        if (rKey.startsWith('__reactProps')) {
+          const fiberKey = allKeys.find(k => k.startsWith('__reactFiber'));
+          if (!fiberKey) return false;
+          fiber = editableEl[fiberKey];
+        }
         let depth = 0;
         let draftProps = null;
 
@@ -1770,7 +1952,34 @@
               return;
             }
 
-            const execOk = document.execCommand('insertText', false, replacementText);
+            const insertViaRange = (txt) => {
+              try {
+                const sel = window.getSelection();
+                if (!sel || sel.rangeCount === 0) return false;
+                const range = sel.getRangeAt(0);
+                range.deleteContents();
+                const node = document.createTextNode(txt);
+                range.insertNode(node);
+                range.setStartAfter(node);
+                range.setEndAfter(node);
+                sel.removeAllRanges();
+                sel.addRange(range);
+                editableEl.dispatchEvent(new InputEvent('input', {
+                  bubbles: true,
+                  cancelable: false,
+                  inputType: 'insertText',
+                  data: txt,
+                }));
+                return true;
+              } catch (_) {
+                return false;
+              }
+            };
+
+            let execOk = insertViaRange(replacementText);
+            if (!execOk && typeof document.execCommand === 'function') {
+              try { execOk = document.execCommand('insertText', false, replacementText); } catch (_) {}
+            }
             snap(`${prefix}_exec_ok=${execOk}`, editableEl);
             if (execOk) {
               finishAttempt(`${prefix}_apres_exec`);
@@ -2049,7 +2258,18 @@
           overflow: auto;
         }
 
-        .text-corrector-menu button:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+        .text-corrector-menu .corrector-apply-btn:focus-visible,
+        .text-corrector-menu .corrector-cancel-btn:focus-visible,
+        .text-corrector-menu .corrector-copy-btn:focus-visible,
+        .text-corrector-menu .corrector-retry-btn:focus-visible,
+        .text-corrector-menu .corrector-close-btn:focus-visible,
+        .text-corrector-menu .corrector-settings-btn:focus-visible,
+        .text-corrector-menu .corrector-toast-undo:focus-visible,
+        .text-corrector-menu .corrector-download-logs-btn:focus-visible {
+          outline: 2px solid #2563eb;
+          outline-offset: 2px;
+          border-radius: 6px;
+        }
 
         /* Header = poignée de drag */
         .corrector-header {
@@ -2063,6 +2283,7 @@
           user-select: none;
         }
         .corrector-dragging .corrector-header { cursor: grabbing; }
+        .corrector-header { touch-action: none; }
         .corrector-title {
           font-weight: 700;
           font-size: 13px;
@@ -2700,6 +2921,7 @@
             min-height: 38px;
             padding-inline: 12px;
           }
+          .corrector-pill::after { display: none; }
         }
         @media (prefers-color-scheme: dark) {
           :host {

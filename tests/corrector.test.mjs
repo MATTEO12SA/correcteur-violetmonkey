@@ -9,7 +9,7 @@ const userscript = readFileSync(join(root, 'corrector.user.js'), 'utf8');
 const readme = readFileSync(join(root, 'README.md'), 'utf8');
 
 test('userscript metadata targets the public LanguageTool API', () => {
-  assert.match(userscript, /@version\s+4\.8\.0/);
+  assert.match(userscript, /@version\s+4\.9\.0/);
   assert.match(userscript, /@connect\s+api\.languagetool\.org/);
   assert.match(userscript, /LANGUAGETOOL_ENDPOINT = 'https:\/\/api\.languagetool\.org\/v2\/check'/);
   assert.doesNotMatch(userscript, /languagetoolplus\.com/);
