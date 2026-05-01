@@ -66,7 +66,7 @@ Pour forcer une mise à jour manuelle :
 - Protection des `@mentions`, `#hashtags`, URLs, emails et blocs inline sensibles
 - Cache persistant des corrections récentes pour accélérer les textes déjà corrigés
 - Gestion claire des limites API, timeouts et erreurs réseau
-- Remplacement automatique renforcé dans les `textarea`, `input`, zones `contenteditable`, éditeurs modernes et SPA, avec fallback **Copier** quand un site refuse la modification
+- Remplacement automatique renforcé dans les `textarea`, `input`, zones `contenteditable`, éditeurs modernes et SPA, avec contexte de sélection vérifié et fallback **Copier** quand un site refuse la modification
 - Panneau déplaçable, position mémorisée entre les sessions
 - Compatible avec les SPA (Facebook, Instagram, Twitter…)
 - Interface isolée en Shadow DOM pour éviter les conflits CSS avec les sites visités
@@ -139,6 +139,8 @@ Les tests utilisent des réponses LanguageTool simulées : ils ne font pas d'app
 - le filtrage des suggestions selon les modes `Chat`, `Équilibré` et `Strict` ;
 - la logique de cache et l'absence de texte complet dans les clés ;
 - certains cas de remplacement automatique testables sans navigateur réel.
+
+L'analyse du code et la recherche GitHub qui guident les améliorations récentes sont documentées dans `docs/code-analysis.md` et `docs/github-research.md`.
 
 ---
 

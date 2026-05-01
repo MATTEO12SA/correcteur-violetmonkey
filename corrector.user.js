@@ -69,7 +69,7 @@
     editorWholeReplaceFailure: 'Impossible de remplacer sur cet éditeur. Utilisez "Copier".',
     editorPartialReplaceFailure: 'Remplacement partiel non fiable sur cet éditeur. Utilisez "Copier" ou sélectionnez tout le texte.',
     replacementCopied: 'Remplacement impossible sur ce champ. La correction a été copiée automatiquement.',
-    replacementCopyFailure: 'Remplacement impossible sur ce champ. La copie automatique a échoué. Utilisez "Copier".',
+    replacementCopyFailure: 'Remplacement impossible sur ce champ. Utilise le bouton Copier pour récupérer la correction.',
     networkError: 'Erreur réseau : impossible de joindre LanguageTool.',
     timeout: 'Délai dépassé. Réessayez avec un passage plus court.',
     invalidResponse: 'Réponse LanguageTool illisible. Réessayez plus tard.',
@@ -851,17 +851,39 @@
       pill.style.top = `${y}px`;
     },
 
-    handlePillScroll() {
-      if (!this.pill || !this._pillSelectionContext) return;
+    getSelectionContextRect(context) {
+      if (!context) return null;
+      if (context.type === 'control') {
+        const el = context.el;
+        if (!el || !el.isConnected || typeof el.getBoundingClientRect !== 'function') return null;
+        const tagName = (el.tagName || '').toUpperCase();
+        if (tagName !== 'INPUT' && tagName !== 'TEXTAREA') return null;
+        const rect = el.getBoundingClientRect();
+        return rect && (rect.width || rect.height) ? rect : null;
+      }
+      if (context.range && typeof context.range.getBoundingClientRect === 'function') {
+        try {
+          const rect = context.range.getBoundingClientRect();
+          if (rect && (rect.width || rect.height)) return rect;
+        } catch (_) {}
+      }
       const sel = window.getSelection();
-      if (!sel || sel.rangeCount === 0) { this.hidePill(); return; }
+      if (!sel || sel.rangeCount === 0) return null;
       try {
         const rect = sel.getRangeAt(0).getBoundingClientRect();
-        if (!rect || (rect.width === 0 && rect.height === 0)) { this.hidePill(); return; }
-        if (rect.bottom < 0 || rect.top > window.innerHeight) { this.hidePill(); return; }
-        this._pillSelectionContext = { ...this._pillSelectionContext, rect };
-        this.positionPill(this.pill, rect);
-      } catch (_) { this.hidePill(); }
+        return rect && (rect.width || rect.height) ? rect : null;
+      } catch (_) {
+        return null;
+      }
+    },
+
+    handlePillScroll() {
+      if (!this.pill || !this._pillSelectionContext) return;
+      const rect = this.getSelectionContextRect(this._pillSelectionContext);
+      if (!rect) { this.hidePill(); return; }
+      if (rect.bottom < 0 || rect.top > window.innerHeight) { this.hidePill(); return; }
+      this._pillSelectionContext = { ...this._pillSelectionContext, rect };
+      this.positionPill(this.pill, rect);
     },
 
     hidePill() {
