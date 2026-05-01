@@ -856,6 +856,8 @@
       if (context.type === 'control') {
         const el = context.el;
         if (!el || !el.isConnected || typeof el.getBoundingClientRect !== 'function') return null;
+        const tagName = (el.tagName || '').toUpperCase();
+        if (tagName !== 'INPUT' && tagName !== 'TEXTAREA') return null;
         const rect = el.getBoundingClientRect();
         return rect && (rect.width || rect.height) ? rect : null;
       }

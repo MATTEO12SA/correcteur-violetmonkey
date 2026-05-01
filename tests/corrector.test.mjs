@@ -11,8 +11,8 @@ const readme = readFileSync(join(root, 'README.md'), 'utf8');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 
 const getBlockBody = (name) => {
-  const marker = `    ${name}(`;
-  const start = userscript.indexOf(marker);
+  const markers = [`    ${name}(`, `    async ${name}(`];
+  const start = Math.max(...markers.map((marker) => userscript.indexOf(marker)));
   assert.notEqual(start, -1, `method ${name} should exist`);
   const braceStart = userscript.indexOf('{', start);
   assert.notEqual(braceStart, -1, `method ${name} should have a body`);
@@ -30,9 +30,10 @@ const getBlockBody = (name) => {
 
 const buildMethod = (name, args, env = {}) => {
   const body = getBlockBody(name);
+  const asyncPrefix = userscript.includes(`    async ${name}(`) ? 'async ' : '';
   const envNames = Object.keys(env);
   const envValues = Object.values(env);
-  return new Function(...envNames, `return function(${args.join(', ')}) {${body}};`)(...envValues);
+  return new Function(...envNames, `return ${asyncPrefix}function(${args.join(', ')}) {${body}};`)(...envValues);
 };
 
 const getConstArrowSource = (name) => {
@@ -432,13 +433,128 @@ test('automatic apply routes through robust replacement and copy fallback helper
   assert.match(userscript, /replacementCopyFailure: 'Remplacement impossible sur ce champ\. Utilise le bouton Copier pour récupérer la correction\.'/);
 });
 
-test('selection pill keeps control selections stable during scroll', () => {
-  assert.match(userscript, /getSelectionContextRect\(context\)/);
-  assert.match(userscript, /context\.type === 'control'/);
-  assert.match(userscript, /!el \|\| !el\.isConnected/);
-  assert.match(userscript, /context\.range\.getBoundingClientRect\(\)/);
-  assert.match(userscript, /handlePillScroll\(\)[\s\S]*getSelectionContextRect\(this\._pillSelectionContext\)/);
-  assert.match(userscript, /this\._pillSelectionContext = \{ \.\.\.this\._pillSelectionContext, rect \}/);
+test('getSelectionContextRect refuses detached controls without reading global selection', () => {
+  let globalSelectionCalls = 0;
+  const getSelectionContextRect = buildMethod('getSelectionContextRect', ['context'], {
+    window: {
+      getSelection() {
+        globalSelectionCalls += 1;
+        throw new Error('global selection should not be read');
+      },
+    },
+  });
+
+  const rect = getSelectionContextRect({
+    type: 'control',
+    el: {
+      tagName: 'INPUT',
+      isConnected: false,
+      getBoundingClientRect() {
+        throw new Error('detached controls should not be measured');
+      },
+    },
+  });
+
+  assert.equal(rect, null);
+  assert.equal(globalSelectionCalls, 0);
+});
+
+test('getSelectionContextRect prefers input and textarea context over window selection', () => {
+  let globalSelectionCalls = 0;
+  const getSelectionContextRect = buildMethod('getSelectionContextRect', ['context'], {
+    window: {
+      getSelection() {
+        globalSelectionCalls += 1;
+        throw new Error('global selection should not be used for controls');
+      },
+    },
+  });
+
+  for (const tagName of ['INPUT', 'TEXTAREA']) {
+    const expectedRect = { left: 10, top: 20, right: 110, bottom: 40, width: 100, height: 20 };
+    const rect = getSelectionContextRect({
+      type: 'control',
+      el: {
+        tagName,
+        isConnected: true,
+        getBoundingClientRect() {
+          return expectedRect;
+        },
+      },
+    });
+
+    assert.equal(rect, expectedRect);
+  }
+  assert.equal(globalSelectionCalls, 0);
+});
+
+test('getSelectionContextRect uses saved DOM ranges before window selection', () => {
+  let globalSelectionCalls = 0;
+  const getSelectionContextRect = buildMethod('getSelectionContextRect', ['context'], {
+    window: {
+      getSelection() {
+        globalSelectionCalls += 1;
+        throw new Error('global selection should not be used when range is valid');
+      },
+    },
+  });
+  const expectedRect = { left: 2, top: 4, right: 20, bottom: 14, width: 18, height: 10 };
+
+  const rect = getSelectionContextRect({
+    type: 'range',
+    range: {
+      getBoundingClientRect() {
+        return expectedRect;
+      },
+    },
+  });
+
+  assert.equal(rect, expectedRect);
+  assert.equal(globalSelectionCalls, 0);
+});
+
+test('handleApplyFailure shows manual copy guidance when automatic copy fails', async () => {
+  const handleApplyFailure = buildMethod('handleApplyFailure', ['message', 'correctedText'], {
+    copyTextToClipboard: async () => false,
+    USER_MESSAGES: {
+      replacementCopied: 'Remplacement impossible sur ce champ. La correction a été copiée automatiquement.',
+      replacementCopyFailure: 'Remplacement impossible sur ce champ. Utilise le bouton Copier pour récupérer la correction.',
+      applyGenericFailure: 'Impossible de remplacer sur ce site. Utilisez "Copier".',
+    },
+  });
+  const copyBtn = { dataset: {}, style: {} };
+  let shownMessage = '';
+
+  await handleApplyFailure.call({
+    getMenuRefs: () => ({ copyBtn }),
+    showApplyError: (message) => { shownMessage = message; },
+  }, 'fallback initial', 'Texte corrigé');
+
+  assert.equal(copyBtn.dataset.text, 'Texte corrigé');
+  assert.equal(copyBtn.style.display, 'inline-block');
+  assert.equal(
+    shownMessage,
+    'Remplacement impossible sur ce champ. Utilise le bouton Copier pour récupérer la correction.'
+  );
+});
+
+test('handleApplyFailure reports automatic copy success after replacement failure', async () => {
+  const handleApplyFailure = buildMethod('handleApplyFailure', ['message', 'correctedText'], {
+    copyTextToClipboard: async () => true,
+    USER_MESSAGES: {
+      replacementCopied: 'Remplacement impossible sur ce champ. La correction a été copiée automatiquement.',
+      replacementCopyFailure: 'Remplacement impossible sur ce champ. Utilise le bouton Copier pour récupérer la correction.',
+      applyGenericFailure: 'Impossible de remplacer sur ce site. Utilisez "Copier".',
+    },
+  });
+  let shownMessage = '';
+
+  await handleApplyFailure.call({
+    getMenuRefs: () => ({ copyBtn: { dataset: {}, style: {} } }),
+    showApplyError: (message) => { shownMessage = message; },
+  }, 'fallback initial', 'Texte corrigé');
+
+  assert.equal(shownMessage, 'Remplacement impossible sur ce champ. La correction a été copiée automatiquement.');
 });
 
 test('UI is isolated in a Shadow DOM root without global style injection', () => {
