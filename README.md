@@ -31,7 +31,7 @@ Une fenêtre d'installation apparaît → clique **Confirmer**.
 4. Attends la correction (quelques secondes)
 5. Clique **Appliquer** pour remplacer le texte dans la page, ou **Copier** pour copier la version corrigée
 
-Utilise **Copier** si la page refuse le remplacement automatique, notamment dans certains éditeurs web complexes ou champs contrôlés par React.
+Le remplacement automatique est renforcé pour les champs `textarea`, `input`, les zones `contenteditable` et plusieurs éditeurs modernes utilisés dans des SPA. Utilise **Copier** si un site empêche encore techniquement la modification automatique, notamment dans certains éditeurs web complexes ou champs contrôlés par React.
 
 ### Raccourcis
 | Action | Comment |
@@ -66,6 +66,7 @@ Pour forcer une mise à jour manuelle :
 - Protection des `@mentions`, `#hashtags`, URLs, emails et blocs inline sensibles
 - Cache persistant des corrections récentes pour accélérer les textes déjà corrigés
 - Gestion claire des limites API, timeouts et erreurs réseau
+- Remplacement automatique renforcé dans les `textarea`, `input`, zones `contenteditable`, éditeurs modernes et SPA, avec fallback **Copier** quand un site refuse la modification
 - Panneau déplaçable, position mémorisée entre les sessions
 - Compatible avec les SPA (Facebook, Instagram, Twitter…)
 - Interface isolée en Shadow DOM pour éviter les conflits CSS avec les sites visités
