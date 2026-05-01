@@ -123,12 +123,22 @@ localStorage.removeItem('__corrector_debug');
 
 ### Vérification du code
 
-Le projet n'a aucune dépendance à installer. Les commandes disponibles sont :
+Le projet peut être vérifié localement avec :
 
 ```bash
 npm run check
 npm test
 ```
+
+Une CI GitHub Actions exécute automatiquement ces commandes sur chaque push et chaque Pull Request.
+
+Les tests utilisent des réponses LanguageTool simulées : ils ne font pas d'appel réseau réel. Ils couvrent notamment :
+
+- la protection des `@mentions`, `#hashtags`, URLs, emails et fragments inline sensibles ;
+- l'application de corrections LanguageTool simulées ;
+- le filtrage des suggestions selon les modes `Chat`, `Équilibré` et `Strict` ;
+- la logique de cache et l'absence de texte complet dans les clés ;
+- certains cas de remplacement automatique testables sans navigateur réel.
 
 ---
 
