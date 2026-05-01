@@ -429,6 +429,16 @@ test('automatic apply routes through robust replacement and copy fallback helper
   assert.match(userscript, /range\.deleteContents\(\)/);
   assert.match(userscript, /handleApplyFailure[\s\S]*copyTextToClipboard\(correctedText\)/);
   assert.match(userscript, /replacementCopied: 'Remplacement impossible sur ce champ\. La correction a été copiée automatiquement\.'/);
+  assert.match(userscript, /replacementCopyFailure: 'Remplacement impossible sur ce champ\. Utilise le bouton Copier pour récupérer la correction\.'/);
+});
+
+test('selection pill keeps control selections stable during scroll', () => {
+  assert.match(userscript, /getSelectionContextRect\(context\)/);
+  assert.match(userscript, /context\.type === 'control'/);
+  assert.match(userscript, /!el \|\| !el\.isConnected/);
+  assert.match(userscript, /context\.range\.getBoundingClientRect\(\)/);
+  assert.match(userscript, /handlePillScroll\(\)[\s\S]*getSelectionContextRect\(this\._pillSelectionContext\)/);
+  assert.match(userscript, /this\._pillSelectionContext = \{ \.\.\.this\._pillSelectionContext, rect \}/);
 });
 
 test('UI is isolated in a Shadow DOM root without global style injection', () => {
