@@ -57,12 +57,13 @@ const getConstArrowSource = (name) => {
 };
 
 test('userscript metadata targets the public LanguageTool API', () => {
-  assert.equal(pkg.version, '4.10.0');
-  assert.match(userscript, /@version\s+4\.10\.0/);
+  assert.equal(pkg.version, '4.11.0');
+  assert.match(userscript, /@version\s+4\.11\.0/);
   assert.match(userscript, /@connect\s+api\.languagetool\.org/);
   assert.match(userscript, /@grant\s+GM_setValue/);
   assert.match(userscript, /@grant\s+GM_getValue/);
   assert.match(userscript, /@grant\s+GM_deleteValue/);
+  assert.match(userscript, /@grant\s+GM_setClipboard/);
   assert.match(userscript, /LANGUAGETOOL_ENDPOINT = 'https:\/\/api\.languagetool\.org\/v2\/check'/);
   assert.doesNotMatch(userscript, /languagetoolplus\.com/);
 });
@@ -178,6 +179,7 @@ test('lruCacheGet/Set evicts old entries and respects TTL', () => {
 test('UI hardening helpers cover copy, contenteditable, abort, and menu position', () => {
   assert.match(userscript, /const copyTextToClipboard = async \(text\) =>/);
   assert.match(userscript, /navigator\.clipboard/);
+  assert.match(userscript, /GM_setClipboard/);
   assert.match(userscript, /document\.execCommand\('copy'\)/);
   assert.match(userscript, /getEditableRootFromNode\(node\)/);
   assert.match(userscript, /isContentEditable/);
@@ -185,6 +187,52 @@ test('UI hardening helpers cover copy, contenteditable, abort, and menu position
   assert.match(userscript, /abortCurrentRequest\(\)/);
   assert.match(userscript, /typeof this\.currentRequest\.abort === 'function'/);
   assert.match(userscript, /getClampedMenuPosition\(menu, x, y\)/);
+});
+
+test('text control replacement planner preserves surrounding text and caret', () => {
+  const planTextControlReplacement = buildMethod(
+    'planTextControlReplacement',
+    ['value', 'start', 'end', 'originalText', 'replacementText']
+  );
+
+  const textareaPlan = planTextControlReplacement('Bonjour le monde', 11, 16, 'monde', 'site');
+  assert.equal(textareaPlan.ok, true);
+  assert.equal(textareaPlan.value, 'Bonjour le site');
+  assert.equal(textareaPlan.selectionStart, 15);
+  assert.equal(textareaPlan.selectionEnd, 15);
+
+  const inputPlan = planTextControlReplacement('abc def ghi', 4, 7, 'def', 'XYZ');
+  assert.equal(inputPlan.ok, true);
+  assert.equal(inputPlan.value, 'abc XYZ ghi');
+  assert.equal(inputPlan.selectionStart, 7);
+});
+
+test('text control replacement planner refuses stale or invalid selections', () => {
+  const planTextControlReplacement = buildMethod(
+    'planTextControlReplacement',
+    ['value', 'start', 'end', 'originalText', 'replacementText']
+  );
+
+  const stale = planTextControlReplacement('Bonjour la page', 8, 10, 'le', 'une');
+  assert.equal(stale.ok, false);
+  assert.equal(stale.reason, 'selection-changed');
+
+  const invalid = planTextControlReplacement('Bonjour', -1, 4, 'Bonj', 'Salut');
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.reason, 'invalid-selection-offsets');
+});
+
+test('automatic apply routes through robust replacement and copy fallback helpers', () => {
+  assert.match(userscript, /applyCorrectionToSelection\(correctedText, selectionContext, applyToken\)/);
+  assert.match(userscript, /kind: el\.tagName === 'TEXTAREA' \? 'textarea' : 'input'/);
+  assert.match(userscript, /setNativeControlValue\(el, value\)/);
+  assert.match(userscript, /Object\.getOwnPropertyDescriptor\(proto, 'value'\)\?\.set/);
+  assert.match(userscript, /new InputEvent\('beforeinput'/);
+  assert.match(userscript, /inputType: 'insertReplacementText'/);
+  assert.match(userscript, /restoreSavedRangeSelection\(this\.selectionSource\)/);
+  assert.match(userscript, /range\.deleteContents\(\)/);
+  assert.match(userscript, /handleApplyFailure[\s\S]*copyTextToClipboard\(correctedText\)/);
+  assert.match(userscript, /replacementCopied: 'Remplacement impossible sur ce champ\. La correction a été copiée automatiquement\.'/);
 });
 
 test('UI is isolated in a Shadow DOM root without global style injection', () => {
@@ -286,4 +334,10 @@ test('README documents privacy, endpoint, and public API limits', () => {
   assert.match(readme, /Cache persistant/);
   assert.match(readme, /7 jours/);
   assert.match(readme, /hash FNV-1a/);
+});
+
+test('README documents stronger automatic replacement without promising every site', () => {
+  assert.match(readme, /remplacement automatique est renforcé pour les champs `textarea`, `input`, les zones `contenteditable`/i);
+  assert.match(readme, /fallback \*\*Copier\*\* quand un site refuse la modification/);
+  assert.doesNotMatch(readme, /100 % des sites|tous les éditeurs modernes sans exception/i);
 });
