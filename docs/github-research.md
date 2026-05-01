@@ -122,6 +122,91 @@ Les recherches ont été faites avec GitHub Search, l'API GitHub et des requête
 - Risque : tests trop couplés au texte source.
 - Solution retenue : rester cohérent avec la suite existante, qui inspecte déjà les helpers du userscript sans bundler.
 
+## Recherche complémentaire : remplacement dans éditeurs modernes
+
+### Source 1
+
+- URL : https://github.com/codemirror/view
+- Licence : MIT.
+- Fichiers lus : `LICENSE`, `src/input.ts`.
+- Idée utile : CodeMirror sépare strictement les événements appartenant à l'éditeur des événements globaux, garde une origine de sélection et refuse les opérations qui ne correspondent plus à l'état courant.
+- Code copié : non.
+- Décision : réécrire l'idée sous forme de validation locale avant remplacement et de retour structuré quand la sélection n'est plus fiable.
+
+### Source 2
+
+- URL : https://github.com/ianstormtaylor/slate
+- Licence : MIT.
+- Fichiers lus : `License.md`, `packages/slate-react/src/components/editable.tsx`.
+- Idée utile : Slate traite `beforeinput` comme un signal critique dans les éditeurs riches, vérifie que la cible appartient bien à l'éditeur et respecte les éditeurs en lecture seule.
+- Code copié : non.
+- Décision : déclencher `beforeinput` avant l'insertion `contenteditable`, arrêter proprement si l'événement est annulé, et refuser les cibles non éditables.
+
+### Source 3
+
+- URL : https://github.com/slab/quill
+- Licence : BSD-3-Clause.
+- Fichiers lus : `LICENSE`, `packages/quill/src/modules/input.ts`.
+- Idée utile : Quill tient compte de `insertReplacementText`, mappe la sélection avant de modifier le contenu et replace le curseur après insertion.
+- Code copié : non.
+- Décision : utiliser `inputType: 'insertReplacementText'`, insérer uniquement le texte sélectionné et replacer la sélection après le texte corrigé.
+
+### Source 4
+
+- URL : https://github.com/facebook/lexical
+- Licence : MIT.
+- Fichiers lus : `LICENSE`, `packages/lexical-playground/__tests__/e2e/Events.spec.mjs`, `packages/lexical-clipboard/src/clipboard.ts`.
+- Idée utile : Lexical teste explicitement `beforeinput` avec `insertReplacementText` et vérifie que les opérations de presse-papiers appartiennent à l'éditeur actif.
+- Code copié : non.
+- Décision : ajouter des tests de non-régression sur le résultat structuré et les fallbacks sans appeler LanguageTool ni simuler tout un navigateur.
+
+### Source 5
+
+- URL : https://github.com/facebook/react
+- Licence : MIT.
+- Fichiers lus : `LICENSE`, `packages/react-dom-bindings/src/client/inputValueTracking.js`.
+- Idée utile : les champs contrôlés suivent leur valeur interne ; l'utilisation du setter natif suivie d'événements `input` / `change` reste la stratégie la plus compatible.
+- Code copié : non.
+- Décision : renforcer les validations autour du setter natif existant et refuser les champs `readonly`, `disabled` ou détachés.
+
+### Source 6
+
+- URL : https://github.com/ProseMirror/prosemirror-view
+- Licence : MIT.
+- Fichiers lus : `LICENSE`, `src/domchange.ts`, `src/input.ts`.
+- Idée utile : ProseMirror capture un état de sélection/document avant l'opération et compare le DOM ensuite pour éviter les remplacements incohérents.
+- Code copié : non.
+- Décision : conserver un remplacement progressif mais retourner une raison d'échec précise quand le `Range` sauvegardé ne correspond plus.
+
+### Source 7
+
+- URL : https://github.com/rxliuli/input-translator
+- Licence : GPL-3.0.
+- Fichiers lus : `LICENSE`, `lib/selection.ts`.
+- Idée utile : l'extension distingue `input`, `textarea`, `contenteditable`, sélection active et fallback via presse-papiers.
+- Code copié : non, licence non retenue pour réutilisation directe.
+- Décision : ne reprendre aucune portion ; seulement confirmer la stratégie générale de séparation des cibles.
+
+## Décisions d'implémentation complémentaires
+
+- Amélioration 1 : retourner `{ ok, method, reason }` depuis les chemins de remplacement.
+- Inspiration GitHub : CodeMirror, ProseMirror et Lexical.
+- Pourquoi : les fallbacks et les tests doivent savoir si l'échec vient d'une sélection modifiée, d'une cible détachée ou d'un éditeur qui refuse l'insertion.
+- Risque : rendre le flux existant plus complexe.
+- Solution retenue : ajouter un helper local `createApplyResult()` et conserver les champs existants `kind`, `focusEl`, `lastApply` quand ils sont utiles.
+
+- Amélioration 2 : renforcer `input` / `textarea`.
+- Inspiration GitHub : React.
+- Pourquoi : les champs contrôlés réagissent mieux au setter natif et aux événements, mais seulement si la sélection originale est encore exacte.
+- Risque : modifier un champ qui n'est plus le bon.
+- Solution retenue : refuser les cibles détachées, `readonly`, `disabled`, offsets invalides ou texte modifié ; préserver focus, curseur et `scrollTop`.
+
+- Amélioration 3 : ajouter un remplacement `contenteditable` basé sur le `Range` sauvegardé.
+- Inspiration GitHub : Slate, Quill, Lexical.
+- Pourquoi : les éditeurs modernes attendent souvent `beforeinput` / `input` avec `insertReplacementText`.
+- Risque : forcer une mutation DOM ignorée par l'état interne de l'éditeur.
+- Solution retenue : vérifier l'appartenance du `Range`, respecter `beforeinput` annulé, insérer un `TextNode` sans toucher à `innerHTML`, puis utiliser `execCommand('insertText')` seulement comme fallback prudent.
+
 ## Attribution et code réutilisé
 
 Aucun code externe n'a été copié. Les modifications sont des réécritures locales inspirées par les comportements observés dans les dépôts étudiés.

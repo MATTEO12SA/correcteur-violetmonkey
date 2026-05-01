@@ -31,7 +31,7 @@ Une fenêtre d'installation apparaît → clique **Confirmer**.
 4. Attends la correction (quelques secondes)
 5. Clique **Appliquer** pour remplacer le texte dans la page, ou **Copier** pour copier la version corrigée
 
-Le remplacement automatique est renforcé pour les champs `textarea`, `input`, les zones `contenteditable` et plusieurs éditeurs modernes utilisés dans des SPA. Utilise **Copier** si un site empêche encore techniquement la modification automatique, notamment dans certains éditeurs web complexes ou champs contrôlés par React.
+Le remplacement automatique utilise plusieurs stratégies selon le contexte : champs `input` / `textarea`, zones `contenteditable`, puis fallback **Copier** si l'éditeur bloque la modification. Utilise **Copier** si un site empêche encore techniquement la modification automatique, notamment dans certains éditeurs web complexes ou champs contrôlés par React.
 
 ### Raccourcis
 | Action | Comment |

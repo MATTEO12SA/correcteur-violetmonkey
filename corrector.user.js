@@ -62,8 +62,8 @@
     noCorrection: 'Aucune correction nécessaire.',
     applyGenericFailure: 'Impossible de remplacer sur ce site. Utilisez "Copier".',
     selectionLost: 'Sélection perdue. Resélectionnez le texte.',
-    selectionChanged: 'Le texte a changé depuis la sélection. Resélectionnez.',
-    fieldRefusedReplacement: 'Remplacement refusé par ce champ. Utilisez "Copier".',
+    selectionChanged: 'La sélection a changé depuis la correction. Sélectionne à nouveau le texte.',
+    fieldRefusedReplacement: 'Ce champ n’est pas modifiable automatiquement. Utilisez "Copier".',
     staticReplacementUnconfirmed: 'Remplacement non confirmé sur cette page. Utilisez "Copier".',
     editorReplacementUnconfirmed: 'Remplacement non confirmé sur cet éditeur. Utilisez "Copier".',
     editorWholeReplaceFailure: 'Impossible de remplacer sur cet éditeur. Utilisez "Copier".',
@@ -1587,13 +1587,31 @@
       return true;
     },
 
-    isControlSelectionValid(context = null) {
+    createApplyResult(ok, method, reason, extra) {
+      const details = extra || {};
+      return {
+        ok: Boolean(ok),
+        method: ok ? method : null,
+        reason: ok ? null : (reason || 'unknown'),
+        ...details,
+      };
+    },
+
+    validateControlSelectionContext(context = null) {
       const source = context || this.selectionSource;
-      if (!source || source.type !== 'control') return false;
+      if (!source || source.type !== 'control') return { ok: false, reason: 'selection-lost' };
       const { el, start, end, rawText } = source;
-      if (!el || !el.isConnected) return false;
-      if (typeof el.value !== 'string') return false;
-      return el.value.slice(start, end) === rawText;
+      if (!el || !el.isConnected) return { ok: false, reason: 'target-detached' };
+      if (el.disabled || el.readOnly) return { ok: false, reason: 'not-editable' };
+      if (typeof el.value !== 'string') return { ok: false, reason: 'invalid-control-value' };
+      if (!Number.isInteger(start) || !Number.isInteger(end)) return { ok: false, reason: 'invalid-selection-offsets' };
+      if (start < 0 || end < start || end > el.value.length) return { ok: false, reason: 'invalid-selection-offsets' };
+      if (el.value.slice(start, end) !== rawText) return { ok: false, reason: 'selection-changed' };
+      return { ok: true, reason: null };
+    },
+
+    isControlSelectionValid(context = null) {
+      return this.validateControlSelectionContext(context).ok;
     },
 
     resetActionState() {
@@ -2020,7 +2038,7 @@
       if (value.slice(start, end) !== originalText) return { ok: false, reason: 'selection-changed' };
       const nextValue = value.slice(0, start) + replacementText + value.slice(end);
       const caret = start + replacementText.length;
-      return { ok: true, value: nextValue, selectionStart: caret, selectionEnd: caret };
+      return { ok: true, reason: null, value: nextValue, selectionStart: caret, selectionEnd: caret };
     },
 
     setNativeControlValue(el, value) {
@@ -2073,41 +2091,168 @@
       }
     },
 
+    rangeBelongsToEditable(range, editableEl) {
+      if (!range || !editableEl || !editableEl.isConnected) return false;
+      const containsNode = (node) => {
+        if (!node) return false;
+        if (node === editableEl) return true;
+        const candidate = node.nodeType === Node.TEXT_NODE
+          ? node.parentElement || node.parentNode
+          : node;
+        return Boolean(candidate && typeof editableEl.contains === 'function' && editableEl.contains(candidate));
+      };
+      return containsNode(range.startContainer) && containsNode(range.endContainer);
+    },
+
+    getActiveSelectionRangeInEditable(editableEl, rawText) {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) return null;
+      const range = sel.getRangeAt(0);
+      if (!this.rangeBelongsToEditable(range, editableEl)) return null;
+      if (normalizeComparableText(range.toString()) !== normalizeComparableText(rawText)) return null;
+      return range;
+    },
+
     applyControlReplacement(selectionContext, replacementText) {
-      if (!this.isControlSelectionValid(selectionContext)) {
-        return { ok: false, kind: selectionContext?.kind || 'control', reason: 'selection-changed' };
-      }
+      const kind = selectionContext?.kind || 'control';
+      const validation = this.validateControlSelectionContext(selectionContext);
+      if (!validation.ok) return this.createApplyResult(false, null, validation.reason, { kind });
+
       const inputEl = selectionContext.el;
       const { start, end, rawText } = selectionContext;
       const originalValue = inputEl.value;
       const plan = this.planTextControlReplacement(originalValue, start, end, rawText, replacementText);
-      if (!plan.ok) return { ...plan, kind: selectionContext.kind || 'control' };
+      if (!plan.ok) return this.createApplyResult(false, null, plan.reason, { kind });
 
       this.focusWithoutScroll(inputEl);
-      this.dispatchReplacementBeforeInput(inputEl, replacementText);
+      const beforeInputAccepted = this.dispatchReplacementBeforeInput(inputEl, replacementText);
+      if (!beforeInputAccepted) {
+        return this.createApplyResult(false, null, 'beforeinput-cancelled', { kind });
+      }
+
+      const isTextarea = inputEl.tagName === 'TEXTAREA';
+      const scrollTop = isTextarea ? inputEl.scrollTop : null;
       this.setNativeControlValue(inputEl, plan.value);
       if (inputEl.value !== plan.value) {
         this.setNativeControlValue(inputEl, originalValue);
-        return { ok: false, kind: selectionContext.kind || 'control', reason: 'field-refused-replacement' };
+        if (isTextarea && scrollTop !== null) inputEl.scrollTop = scrollTop;
+        return this.createApplyResult(false, null, 'field-refused-replacement', { kind });
       }
 
       try {
         inputEl.setSelectionRange(plan.selectionStart, plan.selectionEnd);
       } catch (_) {}
+      if (isTextarea && scrollTop !== null) inputEl.scrollTop = scrollTop;
       this.dispatchReplacementInput(inputEl, replacementText);
       inputEl.dispatchEvent(new Event('change', { bubbles: true }));
 
       if (inputEl.value !== plan.value) {
-        return { ok: false, kind: selectionContext.kind || 'control', reason: 'field-refused-replacement' };
+        return this.createApplyResult(false, null, 'field-refused-replacement', { kind });
       }
 
-      return {
-        ok: true,
-        kind: selectionContext.kind || 'control',
+      return this.createApplyResult(true, kind, null, {
+        kind,
         focusEl: inputEl,
         withUndo: true,
         lastApply: { type: 'input', el: inputEl, originalValue, start, end },
-      };
+      });
+    },
+
+    tryExecCommandReplacement(selectionContext, editableEl, replacementText) {
+      const kind = 'contenteditable';
+      if (!editableEl || !editableEl.isConnected) {
+        return this.createApplyResult(false, null, 'target-detached', { kind });
+      }
+
+      const rawText = selectionContext?.rawText ?? this.selectedRawText;
+      const range = this.getActiveSelectionRangeInEditable(editableEl, rawText);
+      if (!range) return this.createApplyResult(false, null, 'range-invalid', { kind });
+
+      if (typeof document.execCommand !== 'function') {
+        return this.createApplyResult(false, null, 'field-refused-replacement', { kind });
+      }
+
+      const beforeText = editableEl.textContent || '';
+      let inserted = false;
+      try {
+        inserted = document.execCommand('insertText', false, replacementText);
+      } catch (_) {
+        inserted = false;
+      }
+      if (!inserted) return this.createApplyResult(false, null, 'field-refused-replacement', { kind });
+
+      this.dispatchReplacementInput(editableEl, replacementText);
+      const afterText = editableEl.textContent || '';
+      if (afterText === beforeText && !afterText.includes(replacementText)) {
+        return this.createApplyResult(false, null, 'editor-replacement-unconfirmed', { kind });
+      }
+
+      return this.createApplyResult(true, 'exec-command', null, {
+        kind,
+        focusEl: editableEl,
+        withUndo: false,
+        lastApply: { type: 'contenteditable' },
+      });
+    },
+
+    applyContentEditableRangeReplacement(selectionContext, editableEl, replacementText) {
+      const kind = 'contenteditable';
+      if (!editableEl || !editableEl.isConnected) {
+        return this.createApplyResult(false, null, 'target-detached', { kind });
+      }
+      if (!selectionContext?.range) {
+        return this.createApplyResult(false, null, 'range-invalid', { kind });
+      }
+      const rawText = selectionContext.rawText ?? this.selectedRawText;
+      if (!this.isRangeValid(selectionContext)) {
+        return this.createApplyResult(false, null, 'selection-changed', { kind });
+      }
+      if (!this.rangeBelongsToEditable(selectionContext.range, editableEl)) {
+        return this.createApplyResult(false, null, 'not-editable', { kind });
+      }
+
+      this.focusWithoutScroll(editableEl);
+      if (!this.restoreSavedRangeSelection(selectionContext)) {
+        return this.createApplyResult(false, null, 'range-invalid', { kind });
+      }
+
+      const activeRange = this.getActiveSelectionRangeInEditable(editableEl, rawText);
+      if (!activeRange) return this.createApplyResult(false, null, 'selection-changed', { kind });
+
+      const beforeInputAccepted = this.dispatchReplacementBeforeInput(editableEl, replacementText);
+      if (!beforeInputAccepted) {
+        return this.createApplyResult(false, null, 'beforeinput-cancelled', { kind });
+      }
+
+      try {
+        activeRange.deleteContents();
+        const doc = editableEl.ownerDocument || document;
+        const textNode = doc.createTextNode(replacementText);
+        activeRange.insertNode(textNode);
+        activeRange.setStartAfter(textNode);
+        activeRange.setEndAfter(textNode);
+        activeRange.collapse(true);
+
+        const sel = window.getSelection();
+        if (sel) {
+          sel.removeAllRanges();
+          sel.addRange(activeRange);
+        }
+
+        this.dispatchReplacementInput(editableEl, replacementText);
+        if (!textNode.isConnected || textNode.nodeValue !== replacementText) {
+          return this.tryExecCommandReplacement(selectionContext, editableEl, replacementText);
+        }
+
+        return this.createApplyResult(true, 'contenteditable-range', null, {
+          kind,
+          focusEl: editableEl,
+          withUndo: false,
+          lastApply: { type: 'contenteditable' },
+        });
+      } catch (_) {
+        return this.tryExecCommandReplacement(selectionContext, editableEl, replacementText);
+      }
     },
 
     isStaticPageTextReplacementSafe(selectionContext) {
@@ -2124,7 +2269,7 @@
 
     applyStaticPageTextReplacement(selectionContext, replacementText) {
       if (!this.isStaticPageTextReplacementSafe(selectionContext)) {
-        return { ok: false, kind: 'page-text', reason: 'static-range-unverified' };
+        return this.createApplyResult(false, null, 'static-range-unverified', { kind: 'page-text' });
       }
 
       const range = selectionContext.range.cloneRange();
@@ -2133,7 +2278,7 @@
       const textNode = document.createTextNode(replacementText);
       range.insertNode(textNode);
       if (!textNode.isConnected || textNode.nodeValue !== replacementText) {
-        return { ok: false, kind: 'page-text', reason: 'static-replacement-unconfirmed' };
+        return this.createApplyResult(false, null, 'static-replacement-unconfirmed', { kind: 'page-text' });
       }
 
       const newRange = document.createRange();
@@ -2145,8 +2290,7 @@
         sel.addRange(newRange);
       }
 
-      return {
-        ok: true,
+      return this.createApplyResult(true, 'page-text', null, {
         kind: 'page-text',
         withUndo: true,
         lastApply: {
@@ -2156,7 +2300,7 @@
           parentNode: textNode.parentNode,
           nextSibling: textNode.nextSibling,
         },
-      };
+      });
     },
 
     finishApplySuccess(result) {
@@ -2169,9 +2313,13 @@
 
     getApplyFailureMessage(result) {
       const reason = result?.reason || '';
-      if (reason === 'selection-changed') return USER_MESSAGES.selectionChanged;
-      if (reason === 'selection-lost') return USER_MESSAGES.selectionLost;
-      if (reason === 'field-refused-replacement') return USER_MESSAGES.fieldRefusedReplacement;
+      if (reason === 'selection-changed' || reason === 'range-invalid' || reason === 'invalid-selection-offsets') {
+        return USER_MESSAGES.selectionChanged;
+      }
+      if (reason === 'selection-lost' || reason === 'target-detached') return USER_MESSAGES.selectionLost;
+      if (reason === 'field-refused-replacement' || reason === 'not-editable' || reason === 'beforeinput-cancelled') {
+        return USER_MESSAGES.fieldRefusedReplacement;
+      }
       if (reason === 'static-replacement-unconfirmed' || reason === 'static-range-unverified') {
         return USER_MESSAGES.staticReplacementUnconfirmed;
       }
@@ -2197,7 +2345,7 @@
     applyCorrectionToSelection(correctedText, selectionContext, applyToken) {
       const replacementText = this.getReplacementText(correctedText);
       if (!selectionContext) {
-        return { handled: true, ok: false, kind: 'unknown', reason: 'selection-lost' };
+        return this.createApplyResult(false, null, 'selection-lost', { handled: true, kind: 'unknown' });
       }
 
       if (selectionContext.type === 'control') {
@@ -2209,21 +2357,18 @@
 
       const range = selectionContext.range || this.selectedRange;
       if (!range) {
-        return { handled: true, ok: false, kind: 'unknown', reason: 'selection-lost' };
+        return this.createApplyResult(false, null, 'selection-lost', { handled: true, kind: 'unknown' });
       }
 
       const anchor = range.commonAncestorContainer;
       const parent = anchor.nodeType === Node.TEXT_NODE ? anchor.parentElement : anchor;
       const editableEl = this.getEditableRootFromNode(parent);
       if (editableEl) {
-        return {
-          handled: false,
-          ok: false,
-          kind: 'contenteditable',
-          replacementText,
-          editableEl,
-          applyToken,
-        };
+        const result = this.applyContentEditableRangeReplacement(selectionContext, editableEl, replacementText);
+        if (result.ok || result.reason === 'beforeinput-cancelled' || result.reason === 'target-detached' || result.reason === 'not-editable') {
+          return { handled: true, ...result, replacementText, editableEl, applyToken };
+        }
+        return { handled: false, ...result, replacementText, editableEl, applyToken };
       }
 
       return {
@@ -2319,7 +2464,7 @@
               const beforeEvt = new InputEvent('beforeinput', {
                 bubbles: true,
                 cancelable: true,
-                inputType: 'insertText',
+                inputType: 'insertReplacementText',
                 data: replacementText,
               });
               beforeInputHandled = !editableEl.dispatchEvent(beforeEvt);
@@ -2348,7 +2493,7 @@
                 editableEl.dispatchEvent(new InputEvent('input', {
                   bubbles: true,
                   cancelable: false,
-                  inputType: 'insertText',
+                  inputType: 'insertReplacementText',
                   data: txt,
                 }));
                 return true;

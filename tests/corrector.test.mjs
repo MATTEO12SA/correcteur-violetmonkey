@@ -419,6 +419,321 @@ test('text control replacement planner refuses stale or invalid selections', () 
   assert.equal(invalid.reason, 'invalid-selection-offsets');
 });
 
+test('text control replacement validates target state before writing', () => {
+  const validateControlSelectionContext = buildMethod('validateControlSelectionContext', ['context']);
+
+  const validEl = { isConnected: true, value: 'Bonjour le monde' };
+  assert.deepEqual(
+    validateControlSelectionContext({ type: 'control', el: validEl, start: 11, end: 16, rawText: 'monde' }),
+    { ok: true, reason: null }
+  );
+
+  assert.equal(
+    validateControlSelectionContext({ type: 'control', el: { ...validEl, isConnected: false }, start: 11, end: 16, rawText: 'monde' }).reason,
+    'target-detached'
+  );
+  assert.equal(
+    validateControlSelectionContext({ type: 'control', el: { ...validEl, readOnly: true }, start: 11, end: 16, rawText: 'monde' }).reason,
+    'not-editable'
+  );
+  assert.equal(
+    validateControlSelectionContext({ type: 'control', el: validEl, start: 11, end: 16, rawText: 'site' }).reason,
+    'selection-changed'
+  );
+});
+
+test('applyControlReplacement writes textarea selection, preserves cursor and dispatches events', () => {
+  const EventCtor = class {
+    constructor(type, init = {}) {
+      this.type = type;
+      this.bubbles = Boolean(init.bubbles);
+    }
+  };
+  const applyControlReplacement = buildMethod('applyControlReplacement', ['selectionContext', 'replacementText'], {
+    Event: EventCtor,
+  });
+  const createApplyResult = buildMethod('createApplyResult', ['ok', 'method', 'reason', 'extra = {}']);
+  const validateControlSelectionContext = buildMethod('validateControlSelectionContext', ['context']);
+  const planTextControlReplacement = buildMethod(
+    'planTextControlReplacement',
+    ['value', 'start', 'end', 'originalText', 'replacementText']
+  );
+  const events = [];
+  const textarea = {
+    tagName: 'TEXTAREA',
+    isConnected: true,
+    disabled: false,
+    readOnly: false,
+    value: 'Bonjour le monde',
+    scrollTop: 42,
+    focusOptions: null,
+    selectionStart: null,
+    selectionEnd: null,
+    focus(options) { this.focusOptions = options; },
+    setSelectionRange(start, end) {
+      this.selectionStart = start;
+      this.selectionEnd = end;
+    },
+    dispatchEvent(event) {
+      events.push(event.type);
+      return true;
+    },
+  };
+  const harness = {
+    createApplyResult,
+    validateControlSelectionContext(context) {
+      return validateControlSelectionContext.call(this, context);
+    },
+    planTextControlReplacement,
+    focusWithoutScroll(el) { el.focus({ preventScroll: true }); },
+    dispatchReplacementBeforeInput() {
+      events.push('beforeinput');
+      return true;
+    },
+    setNativeControlValue(el, value) { el.value = value; },
+    dispatchReplacementInput() { events.push('input'); },
+  };
+
+  const result = applyControlReplacement.call(
+    harness,
+    { type: 'control', kind: 'textarea', el: textarea, start: 11, end: 16, rawText: 'monde' },
+    'site'
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.method, 'textarea');
+  assert.equal(result.reason, null);
+  assert.equal(textarea.value, 'Bonjour le site');
+  assert.equal(textarea.selectionStart, 15);
+  assert.equal(textarea.selectionEnd, 15);
+  assert.equal(textarea.scrollTop, 42);
+  assert.deepEqual(events, ['beforeinput', 'input', 'change']);
+});
+
+test('applyControlReplacement refuses stale, readonly, detached, and canceled inputs', () => {
+  const EventCtor = class {
+    constructor(type) { this.type = type; }
+  };
+  const applyControlReplacement = buildMethod('applyControlReplacement', ['selectionContext', 'replacementText'], {
+    Event: EventCtor,
+  });
+  const createApplyResult = buildMethod('createApplyResult', ['ok', 'method', 'reason', 'extra = {}']);
+  const validateControlSelectionContext = buildMethod('validateControlSelectionContext', ['context']);
+  const planTextControlReplacement = buildMethod(
+    'planTextControlReplacement',
+    ['value', 'start', 'end', 'originalText', 'replacementText']
+  );
+  const makeHarness = (beforeInputAccepted = true) => ({
+    createApplyResult,
+    validateControlSelectionContext(context) {
+      return validateControlSelectionContext.call(this, context);
+    },
+    planTextControlReplacement,
+    focusWithoutScroll() {},
+    dispatchReplacementBeforeInput() { return beforeInputAccepted; },
+    setNativeControlValue(el, value) { el.value = value; },
+    dispatchReplacementInput() {},
+  });
+  const makeInput = (overrides = {}) => ({
+    tagName: 'INPUT',
+    isConnected: true,
+    disabled: false,
+    readOnly: false,
+    value: 'abc def ghi',
+    setSelectionRange() {},
+    dispatchEvent() { return true; },
+    ...overrides,
+  });
+
+  const stale = applyControlReplacement.call(
+    makeHarness(),
+    { type: 'control', kind: 'input', el: makeInput(), start: 4, end: 7, rawText: 'xyz' },
+    'DEF'
+  );
+  assert.equal(stale.ok, false);
+  assert.equal(stale.method, null);
+  assert.equal(stale.reason, 'selection-changed');
+
+  const readonly = applyControlReplacement.call(
+    makeHarness(),
+    { type: 'control', kind: 'input', el: makeInput({ readOnly: true }), start: 4, end: 7, rawText: 'def' },
+    'DEF'
+  );
+  assert.equal(readonly.reason, 'not-editable');
+
+  const detached = applyControlReplacement.call(
+    makeHarness(),
+    { type: 'control', kind: 'input', el: makeInput({ isConnected: false }), start: 4, end: 7, rawText: 'def' },
+    'DEF'
+  );
+  assert.equal(detached.reason, 'target-detached');
+
+  const canceled = applyControlReplacement.call(
+    makeHarness(false),
+    { type: 'control', kind: 'input', el: makeInput(), start: 4, end: 7, rawText: 'def' },
+    'DEF'
+  );
+  assert.equal(canceled.reason, 'beforeinput-cancelled');
+});
+
+test('contenteditable range replacement inserts text and returns a structured result', () => {
+  const insertedNodes = [];
+  const events = [];
+  const fakeSelection = {
+    rangeCount: 1,
+    removeAllRangesCalled: false,
+    getRangeAt() { return range; },
+    removeAllRanges() { this.removeAllRangesCalled = true; },
+    addRange(nextRange) { this.addedRange = nextRange; },
+  };
+  const windowStub = { getSelection: () => fakeSelection };
+  const applyContentEditableRangeReplacement = buildMethod(
+    'applyContentEditableRangeReplacement',
+    ['selectionContext', 'editableEl', 'replacementText'],
+    { window: windowStub, document: { createTextNode: (text) => ({ nodeType: 3, nodeValue: text, isConnected: false }) } }
+  );
+  const createApplyResult = buildMethod('createApplyResult', ['ok', 'method', 'reason', 'extra = {}']);
+  const editable = {
+    isConnected: true,
+    textContent: 'Je suis aller.',
+    ownerDocument: {
+      createTextNode(text) {
+        return { nodeType: 3, nodeValue: text, isConnected: false };
+      },
+    },
+  };
+  const textNode = { nodeType: 3, isConnected: true, parentElement: editable };
+  const range = {
+    startContainer: textNode,
+    endContainer: textNode,
+    toString: () => 'aller',
+    deleteContents() { editable.textContent = 'Je suis .'; },
+    insertNode(node) {
+      node.isConnected = true;
+      insertedNodes.push(node);
+      editable.textContent = 'Je suis allé.';
+    },
+    setStartAfter(node) { this.startAfter = node; },
+    setEndAfter(node) { this.endAfter = node; },
+    collapse(value) { this.collapsed = value; },
+  };
+  const harness = {
+    createApplyResult,
+    isRangeValid: () => true,
+    rangeBelongsToEditable: () => true,
+    focusWithoutScroll() {},
+    restoreSavedRangeSelection: () => true,
+    getActiveSelectionRangeInEditable: () => range,
+    dispatchReplacementBeforeInput: () => true,
+    dispatchReplacementInput: () => { events.push('input'); },
+    tryExecCommandReplacement() { throw new Error('execCommand fallback should not run'); },
+  };
+
+  const result = applyContentEditableRangeReplacement.call(
+    harness,
+    { type: 'range', range, rawText: 'aller' },
+    editable,
+    'allé'
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.method, 'contenteditable-range');
+  assert.equal(result.reason, null);
+  assert.equal(editable.textContent, 'Je suis allé.');
+  assert.equal(insertedNodes[0].nodeValue, 'allé');
+  assert.deepEqual(events, ['input']);
+});
+
+test('contenteditable replacement refuses invalid context and can fall back to execCommand', () => {
+  const fakeSelection = { rangeCount: 1, getRangeAt: () => range, removeAllRanges() {}, addRange() {} };
+  const applyContentEditableRangeReplacement = buildMethod(
+    'applyContentEditableRangeReplacement',
+    ['selectionContext', 'editableEl', 'replacementText'],
+    { window: { getSelection: () => fakeSelection }, document: { createTextNode: (text) => ({ nodeValue: text }) } }
+  );
+  const createApplyResult = buildMethod('createApplyResult', ['ok', 'method', 'reason', 'extra = {}']);
+  const editable = { isConnected: true, ownerDocument: { createTextNode: (text) => ({ nodeValue: text }) } };
+  const range = {
+    toString: () => 'aller',
+    deleteContents() { throw new Error('blocked by editor'); },
+  };
+  const baseHarness = {
+    createApplyResult,
+    isRangeValid: () => true,
+    rangeBelongsToEditable: () => true,
+    focusWithoutScroll() {},
+    restoreSavedRangeSelection: () => true,
+    getActiveSelectionRangeInEditable: () => range,
+    dispatchReplacementBeforeInput: () => true,
+    dispatchReplacementInput() {},
+  };
+
+  const missingRange = applyContentEditableRangeReplacement.call(
+    baseHarness,
+    { type: 'range', rawText: 'aller' },
+    editable,
+    'allé'
+  );
+  assert.equal(missingRange.ok, false);
+  assert.equal(missingRange.reason, 'range-invalid');
+
+  const detached = applyContentEditableRangeReplacement.call(
+    baseHarness,
+    { type: 'range', range, rawText: 'aller' },
+    { isConnected: false },
+    'allé'
+  );
+  assert.equal(detached.reason, 'target-detached');
+
+  const stale = applyContentEditableRangeReplacement.call(
+    { ...baseHarness, isRangeValid: () => false },
+    { type: 'range', range, rawText: 'aller' },
+    editable,
+    'allé'
+  );
+  assert.equal(stale.reason, 'selection-changed');
+
+  const fallback = applyContentEditableRangeReplacement.call(
+    {
+      ...baseHarness,
+      tryExecCommandReplacement() {
+        return createApplyResult(true, 'exec-command', null, { kind: 'contenteditable' });
+      },
+    },
+    { type: 'range', range, rawText: 'aller' },
+    editable,
+    'allé'
+  );
+  assert.equal(fallback.ok, true);
+  assert.equal(fallback.method, 'exec-command');
+});
+
+test('applyCorrectionToSelection returns ok method and reason fields', () => {
+  const createApplyResult = buildMethod('createApplyResult', ['ok', 'method', 'reason', 'extra = {}']);
+  const applyCorrectionToSelection = buildMethod(
+    'applyCorrectionToSelection',
+    ['correctedText', 'selectionContext', 'applyToken'],
+    { Node: { TEXT_NODE: 3 } }
+  );
+
+  const missing = applyCorrectionToSelection.call({
+    createApplyResult,
+    getReplacementText: (text) => text,
+  }, 'texte', null, 1);
+  assert.equal(missing.ok, false);
+  assert.equal(missing.method, null);
+  assert.equal(missing.reason, 'selection-lost');
+
+  const success = applyCorrectionToSelection.call({
+    createApplyResult,
+    getReplacementText: (text) => text,
+    applyControlReplacement: () => createApplyResult(true, 'input', null, { kind: 'input' }),
+  }, 'texte', { type: 'control', kind: 'input' }, 1);
+  assert.equal(success.ok, true);
+  assert.equal(success.method, 'input');
+  assert.equal(success.reason, null);
+});
+
 test('automatic apply routes through robust replacement and copy fallback helpers', () => {
   assert.match(userscript, /applyCorrectionToSelection\(correctedText, selectionContext, applyToken\)/);
   assert.match(userscript, /kind: el\.tagName === 'TEXTAREA' \? 'textarea' : 'input'/);
@@ -428,6 +743,8 @@ test('automatic apply routes through robust replacement and copy fallback helper
   assert.match(userscript, /inputType: 'insertReplacementText'/);
   assert.match(userscript, /restoreSavedRangeSelection\(this\.selectionSource\)/);
   assert.match(userscript, /range\.deleteContents\(\)/);
+  assert.match(userscript, /document\.execCommand\('insertText', false, replacementText\)/);
+  assert.match(userscript, /if \(result\.ok\) this\.finishApplySuccess\(result\);\s*else void this\.handleApplyFailure/);
   assert.match(userscript, /handleApplyFailure[\s\S]*copyTextToClipboard\(correctedText\)/);
   assert.match(userscript, /replacementCopied: 'Remplacement impossible sur ce champ\. La correction a été copiée automatiquement\.'/);
   assert.match(userscript, /replacementCopyFailure: 'Remplacement impossible sur ce champ\. Utilise le bouton Copier pour récupérer la correction\.'/);
@@ -659,8 +976,8 @@ test('README documents privacy, endpoint, and public API limits', () => {
 });
 
 test('README documents stronger automatic replacement without promising every site', () => {
-  assert.match(readme, /remplacement automatique est renforcé pour les champs `textarea`, `input`, les zones `contenteditable`/i);
-  assert.match(readme, /fallback \*\*Copier\*\* quand un site refuse la modification/);
+  assert.match(readme, /remplacement automatique utilise plusieurs stratégies selon le contexte/i);
+  assert.match(readme, /champs `input` \/ `textarea`, zones `contenteditable`, puis fallback \*\*Copier\*\*/);
   assert.doesNotMatch(readme, /100 % des sites|tous les éditeurs modernes sans exception/i);
 });
 
