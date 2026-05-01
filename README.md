@@ -66,7 +66,6 @@ Pour forcer une mise à jour manuelle :
 - Protection des `@mentions`, `#hashtags`, URLs, emails et blocs inline sensibles
 - Cache persistant des corrections récentes pour accélérer les textes déjà corrigés
 - Gestion claire des limites API, timeouts et erreurs réseau
-- Remplacement automatique renforcé dans les `textarea`, `input`, zones `contenteditable`, éditeurs modernes et SPA, avec contexte de sélection vérifié et fallback **Copier** quand un site refuse la modification
 - Panneau déplaçable, position mémorisée entre les sessions
 - Compatible avec les SPA (Facebook, Instagram, Twitter…)
 - Interface isolée en Shadow DOM pour éviter les conflits CSS avec les sites visités
