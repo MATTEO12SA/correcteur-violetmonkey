@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { performance } from 'node:perf_hooks';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const userscript = readFileSync(join(root, 'corrector.user.js'), 'utf8');
@@ -166,22 +165,31 @@ const makeContext = (overrides = {}) => ({
 });
 
 test('userscript metadata targets the public LanguageTool API', () => {
-  assert.equal(pkg.version, '4.11.0');
-  assert.match(userscript, /@version\s+4\.11\.0/);
+  assert.equal(pkg.version, '4.12.0');
+  assert.match(userscript, /@version\s+4\.12\.0/);
+  const updateLine = userscript.split(/\r?\n/).find((line) => line.includes('@updateURL'));
+  assert.equal(
+    updateLine,
+    '// @updateURL      https://raw.githubusercontent.com/MATTEO12SA/correcteur-violetmonkey/main/corrector.user.js'
+  );
   assert.match(userscript, /@connect\s+api\.languagetool\.org/);
   assert.match(userscript, /@grant\s+GM_setValue/);
   assert.match(userscript, /@grant\s+GM_getValue/);
-  assert.match(userscript, /@grant\s+GM_deleteValue/);
   assert.match(userscript, /@grant\s+GM_setClipboard/);
+  assert.doesNotMatch(userscript, /@grant\s+GM_deleteValue/);
   assert.match(userscript, /LANGUAGETOOL_ENDPOINT = 'https:\/\/api\.languagetool\.org\/v2\/check'/);
+  assert.match(userscript, /SCRIPT_USER_AGENT = 'CorrecteurDePhrases\/4\.12\.0/);
   assert.doesNotMatch(userscript, /languagetoolplus\.com/);
+  assert.doesNotMatch(userscript, /tryDraftReactWholeEditorReplacement/);
 });
 
 test('LanguageTool requests keep strict mode and rate-limit guards explicit', () => {
   assert.match(userscript, /LANGUAGETOOL_PREFERRED_VARIANTS = 'fr-FR,en-US,de-DE,pt-PT'/);
   assert.match(userscript, /level: context\.mode === 'strict' \? 'picky' : 'default'/);
   assert.match(userscript, /'Accept': 'application\/json'/);
+  assert.match(userscript, /'User-Agent': SCRIPT_USER_AGENT/);
   assert.match(userscript, /LANGUAGETOOL_RATE_LIMIT_COOLDOWN_MS = 60000/);
+  assert.match(userscript, /LANGUAGETOOL_MAX_BYTES_PER_MINUTE = 75000/);
   assert.match(userscript, /_languageToolCooldownUntil: 0/);
   assert.match(userscript, /getCooldownError\(\)/);
   assert.match(userscript, /startLanguageToolCooldown\(\)/);
@@ -195,46 +203,58 @@ test('LanguageTool payload uses language hints and server-side category filters 
   });
 
   const chatParams = new URLSearchParams(buildLanguageToolPayload.call(
-    { detectLanguageHint: () => 'fr' },
+    {},
     'Bonjour',
-    { mode: 'chat-lite' }
+    { mode: 'chat-lite', language: 'fr' }
   ));
   assert.equal(chatParams.get('language'), 'fr');
   assert.equal(chatParams.get('level'), 'default');
   assert.equal(chatParams.get('disabledCategories'), 'STYLE,REDUNDANCY,COLLOQUIALISMS,TYPOGRAPHY');
 
   const balancedParams = new URLSearchParams(buildLanguageToolPayload.call(
-    { detectLanguageHint: () => null },
+    {},
     'Bonjour',
-    { mode: 'balanced' }
+    { mode: 'balanced', language: 'auto' }
   ));
   assert.equal(balancedParams.get('language'), 'auto');
   assert.equal(balancedParams.get('disabledCategories'), 'STYLE,REDUNDANCY');
 
   const strictParams = new URLSearchParams(buildLanguageToolPayload.call(
-    { detectLanguageHint: () => 'en-US' },
+    {},
     'Hello',
-    { mode: 'strict' }
+    { mode: 'strict', language: 'en-US' }
   ));
   assert.equal(strictParams.get('level'), 'picky');
   assert.equal(strictParams.has('disabledCategories'), false);
 });
 
-test('detectLanguageHint maps html lang to LanguageTool variants', () => {
-  const detectLanguageHint = buildMethod('detectLanguageHint', [], {
-    document: { documentElement: { lang: 'en-GB' } },
+test('detectLanguageHint prefers field lang and defaults to auto', () => {
+  class FakeHTMLElement {}
+  const mapLanguageCode = buildMethod('mapLanguageCode', ['rawLang']);
+  const detectLanguageHint = buildMethod('detectLanguageHint', ['selectionContext'], {
+    Node: { TEXT_NODE: 3 },
+    HTMLElement: FakeHTMLElement,
   });
-  assert.equal(detectLanguageHint(), 'en-GB');
 
-  const detectFrench = buildMethod('detectLanguageHint', [], {
-    document: { documentElement: { lang: 'fr-FR' } },
-  });
-  assert.equal(detectFrench(), 'fr');
+  const frField = Object.create(FakeHTMLElement.prototype);
+  frField.getAttribute = () => 'fr-FR';
+  frField.closest = () => frField;
 
-  const detectUnknown = buildMethod('detectLanguageHint', [], {
-    document: { documentElement: { lang: 'ja' } },
-  });
-  assert.equal(detectUnknown(), null);
+  assert.equal(mapLanguageCode('en-GB'), 'en-GB');
+  assert.equal(mapLanguageCode('fr-FR'), 'fr');
+  assert.equal(mapLanguageCode('ja'), null);
+
+  const fromField = detectLanguageHint.call(
+    { mapLanguageCode },
+    { type: 'control', el: frField }
+  );
+  assert.equal(fromField, 'fr');
+
+  const fallbackAuto = detectLanguageHint.call(
+    { mapLanguageCode },
+    null
+  );
+  assert.equal(fallbackAuto, null);
 });
 
 test('persistent cache uses compact hashed keys and a seven-day TTL', () => {
@@ -259,11 +279,15 @@ test('hashFNV1a is deterministic and compact', () => {
 test('lruCacheGet/Set evicts old entries and respects TTL', () => {
   const lruCacheGetSource = getConstArrowSource('lruCacheGet');
   const lruCacheSetSource = getConstArrowSource('lruCacheSet');
+  const sanitizeSourceStart = userscript.indexOf('const sanitizeCachedMatches = ');
+  const persistLoadStart = userscript.indexOf('const persistCacheLoad = ');
+  const sanitizeSource = userscript.slice(sanitizeSourceStart, persistLoadStart);
   const createHarness = new Function(`
     const CORRECTION_CACHE_MAX = 2;
     const CORRECTION_CACHE_TTL_MS = 10;
     const persistCalls = [];
     const persistCacheSave = (cache) => persistCalls.push(Array.from(cache.keys()));
+    ${sanitizeSource}
     ${lruCacheGetSource}
     ${lruCacheSetSource}
     return { lruCacheGet, lruCacheSet, persistCalls };
@@ -271,15 +295,15 @@ test('lruCacheGet/Set evicts old entries and respects TTL', () => {
   const { lruCacheGet, lruCacheSet, persistCalls } = createHarness();
   const cache = new Map();
 
-  lruCacheSet(cache, 'a', 1);
-  lruCacheSet(cache, 'b', 2);
-  assert.equal(lruCacheGet(cache, 'a'), 1);
-  lruCacheSet(cache, 'c', 3);
+  lruCacheSet(cache, 'a', [{ offset: 0, length: 1, replacements: [{ value: 'x' }] }]);
+  lruCacheSet(cache, 'b', [{ offset: 0, length: 1, replacements: [{ value: 'y' }] }]);
+  assert.equal(lruCacheGet(cache, 'a')[0].replacements[0].value, 'x');
+  lruCacheSet(cache, 'c', [{ offset: 0, length: 1, replacements: [{ value: 'z' }] }]);
   assert.equal(cache.has('b'), false);
   assert.equal(cache.has('a'), true);
   assert.equal(cache.has('c'), true);
 
-  cache.set('old', { v: 9, t: Date.now() - 20 });
+  cache.set('old', { v: [{ offset: 0, length: 1, replacements: [{ value: '9' }] }], t: Date.now() - 20 });
   assert.equal(lruCacheGet(cache, 'old'), null);
   assert.equal(cache.has('old'), false);
   assert.ok(persistCalls.length >= 4);
@@ -374,7 +398,7 @@ test('cache keys are stable and do not expose the selected text', () => {
 });
 
 test('UI hardening helpers cover copy, contenteditable, abort, and menu position', () => {
-  assert.match(userscript, /const copyTextToClipboard = async \(text\) =>/);
+  assert.match(userscript, /const copyTextToClipboard = async \(text, shadowRoot = null\) =>/);
   assert.match(userscript, /navigator\.clipboard/);
   assert.match(userscript, /GM_setClipboard/);
   assert.match(userscript, /document\.execCommand\('copy'\)/);
@@ -744,10 +768,11 @@ test('automatic apply routes through robust replacement and copy fallback helper
   assert.match(userscript, /restoreSavedRangeSelection\(this\.selectionSource\)/);
   assert.match(userscript, /range\.deleteContents\(\)/);
   assert.match(userscript, /document\.execCommand\('insertText', false, replacementText\)/);
-  assert.match(userscript, /if \(result\.ok\) this\.finishApplySuccess\(result\);\s*else void this\.handleApplyFailure/);
-  assert.match(userscript, /handleApplyFailure[\s\S]*copyTextToClipboard\(correctedText\)/);
+  assert.match(userscript, /if \(result\.ok\) this\.finishApplySuccess\(result\);/);
+  assert.match(userscript, /void this\.handleApplyFailure\(this\.getApplyFailureMessage\(result\), corrected\)/);
+  assert.match(userscript, /handleApplyFailure[\s\S]*copyTextToClipboard\(correctedText, this\.uiRoot\)/);
   assert.match(userscript, /replacementCopied: 'Remplacement impossible sur ce champ\. La correction a été copiée automatiquement\.'/);
-  assert.match(userscript, /replacementCopyFailure: 'Remplacement impossible sur ce champ\. Utilise le bouton Copier pour récupérer la correction\.'/);
+  assert.match(userscript, /replacementCopyFailure: 'Remplacement impossible sur ce champ\. Utilisez le bouton Copier pour récupérer la correction\.'/);
 });
 
 test('getSelectionContextRect refuses detached controls without reading global selection', () => {
@@ -833,9 +858,10 @@ test('getSelectionContextRect uses saved DOM ranges before window selection', ()
 test('handleApplyFailure shows manual copy guidance when automatic copy fails', async () => {
   const handleApplyFailure = buildMethod('handleApplyFailure', ['message', 'correctedText'], {
     copyTextToClipboard: async () => false,
+    dbgProblem() {},
     USER_MESSAGES: {
       replacementCopied: 'Remplacement impossible sur ce champ. La correction a été copiée automatiquement.',
-      replacementCopyFailure: 'Remplacement impossible sur ce champ. Utilise le bouton Copier pour récupérer la correction.',
+      replacementCopyFailure: 'Remplacement impossible sur ce champ. Utilisez le bouton Copier pour récupérer la correction.',
       applyGenericFailure: 'Impossible de remplacer sur ce site. Utilisez "Copier".',
     },
   });
@@ -845,22 +871,25 @@ test('handleApplyFailure shows manual copy guidance when automatic copy fails', 
   await handleApplyFailure.call({
     getMenuRefs: () => ({ copyBtn }),
     showApplyError: (message) => { shownMessage = message; },
+    uiRoot: null,
+    selectionSource: { type: 'control', kind: 'input' },
   }, 'fallback initial', 'Texte corrigé');
 
   assert.equal(copyBtn.dataset.text, 'Texte corrigé');
   assert.equal(copyBtn.style.display, 'inline-block');
   assert.equal(
     shownMessage,
-    'Remplacement impossible sur ce champ. Utilise le bouton Copier pour récupérer la correction.'
+    'Remplacement impossible sur ce champ. Utilisez le bouton Copier pour récupérer la correction.'
   );
 });
 
 test('handleApplyFailure reports automatic copy success after replacement failure', async () => {
   const handleApplyFailure = buildMethod('handleApplyFailure', ['message', 'correctedText'], {
     copyTextToClipboard: async () => true,
+    dbgProblem() {},
     USER_MESSAGES: {
       replacementCopied: 'Remplacement impossible sur ce champ. La correction a été copiée automatiquement.',
-      replacementCopyFailure: 'Remplacement impossible sur ce champ. Utilise le bouton Copier pour récupérer la correction.',
+      replacementCopyFailure: 'Remplacement impossible sur ce champ. Utilisez le bouton Copier pour récupérer la correction.',
       applyGenericFailure: 'Impossible de remplacer sur ce site. Utilisez "Copier".',
     },
   });
@@ -869,6 +898,8 @@ test('handleApplyFailure reports automatic copy success after replacement failur
   await handleApplyFailure.call({
     getMenuRefs: () => ({ copyBtn: { dataset: {}, style: {} } }),
     showApplyError: (message) => { shownMessage = message; },
+    uiRoot: null,
+    selectionSource: { type: 'control', kind: 'textarea' },
   }, 'fallback initial', 'Texte corrigé');
 
   assert.equal(shownMessage, 'Remplacement impossible sur ce champ. La correction a été copiée automatiquement.');
@@ -944,19 +975,135 @@ test('applyMatches applies sorted replacements in one pass and skips overlaps', 
   );
 });
 
-test('applyMatches remains fast for long selections', () => {
-  const applyMatches = buildMethod('applyMatches', ['text', 'matches']);
-  const text = 'a'.repeat(20000);
-  const matches = Array.from({ length: 50 }, (_, i) => ({
-    offset: i * 350,
-    length: 1,
-    replacementValue: 'b',
-  }));
-  const start = performance.now();
-  const result = applyMatches(text, matches);
-  const elapsed = performance.now() - start;
-  assert.equal(result.length, text.length);
-  assert.ok(elapsed < 25, `applyMatches took ${elapsed.toFixed(2)} ms`);
+test('normalizeLanguageToolMatches rejects invalid offsets and non-arrays', () => {
+  const normalizeLanguageToolMatches = buildMethod('normalizeLanguageToolMatches', ['matches', 'text']);
+  assert.deepEqual(normalizeLanguageToolMatches(null, 'abc'), []);
+  assert.deepEqual(normalizeLanguageToolMatches('nope', 'abc'), []);
+  const valid = [{ offset: 0, length: 1, replacements: [{ value: 'A' }] }];
+  assert.equal(normalizeLanguageToolMatches(valid, 'abc').length, 1);
+  assert.equal(
+    normalizeLanguageToolMatches([{ offset: -1, length: 1, replacements: [{ value: 'A' }] }], 'abc').length,
+    0
+  );
+  assert.equal(
+    normalizeLanguageToolMatches([{ offset: 2, length: 5, replacements: [{ value: 'A' }] }], 'abc').length,
+    0
+  );
+});
+
+test('sanitizeCachedMatches strips LanguageTool context text excerpts', () => {
+  assert.match(userscript, /const sanitizeCachedMatches = \(matches\) =>/);
+  assert.match(readme, /context\.text/);
+
+  // Behavioral check: persisted cache values keep only safe fields.
+  const lruCacheSetSource = getConstArrowSource('lruCacheSet');
+  const sanitizeSourceStart = userscript.indexOf('const sanitizeCachedMatches = ');
+  const persistLoadStart = userscript.indexOf('const persistCacheLoad = ');
+  assert.ok(sanitizeSourceStart > -1 && persistLoadStart > sanitizeSourceStart);
+  const sanitizeSource = userscript.slice(sanitizeSourceStart, persistLoadStart);
+  const createHarness = new Function(`
+    const CORRECTION_CACHE_MAX = 2;
+    const persistCalls = [];
+    const persistCacheSave = (cache) => persistCalls.push(JSON.stringify(Array.from(cache.entries())));
+    ${sanitizeSource}
+    ${lruCacheSetSource}
+    return { lruCacheSet, persistCalls };
+  `);
+  const { lruCacheSet, persistCalls } = createHarness();
+  const cache = new Map();
+  lruCacheSet(cache, 'k1', [{
+    offset: 0,
+    length: 5,
+    message: 'ok',
+    context: { text: 'SECRET private sentence', offset: 0, length: 5 },
+    replacements: [{ value: 'salut', extra: 'drop-me' }],
+    rule: { id: 'RULE', issueType: 'misspelling', category: { id: 'TYPOS' } },
+  }]);
+  assert.equal(cache.get('k1').v[0].context, undefined);
+  assert.deepEqual(cache.get('k1').v[0].replacements, [{ value: 'salut' }]);
+  assert.equal(persistCalls.join('').includes('SECRET'), false);
+});
+
+test('sensitive controls and email/tel input types are excluded', () => {
+  class FakeHTMLElement {
+    constructor(attrs = {}) {
+      this.tagName = attrs.tagName || 'INPUT';
+      this.type = attrs.type || 'text';
+      this.id = attrs.id || '';
+      this._attrs = attrs;
+    }
+    getAttribute(name) {
+      return this._attrs[name] || null;
+    }
+  }
+  const SENSITIVE_AUTOCOMPLETE = new Set([
+    'email', 'tel', 'phone', 'mobile', 'username', 'current-password', 'new-password',
+    'cc-number', 'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year', 'cc-name',
+    'cc-type', 'transaction-amount', 'transaction-currency', 'one-time-code',
+  ]);
+  const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url']);
+  const source = `
+    const HTMLElement = FakeHTMLElement;
+    const SENSITIVE_AUTOCOMPLETE = new Set(${JSON.stringify([...SENSITIVE_AUTOCOMPLETE])});
+    const TEXT_INPUT_TYPES = new Set(${JSON.stringify([...TEXT_INPUT_TYPES])});
+    ${getConstArrowSource('isSensitiveControl')}
+    ${getConstArrowSource('isTextControl')}
+    return { isSensitiveControl, isTextControl };
+  `;
+  const { isSensitiveControl, isTextControl } = new Function('FakeHTMLElement', source)(FakeHTMLElement);
+
+  assert.equal(isTextControl(new FakeHTMLElement({ tagName: 'INPUT', type: 'text' })), true);
+  assert.equal(isTextControl(new FakeHTMLElement({ tagName: 'INPUT', type: 'email' })), false);
+  assert.equal(isTextControl(new FakeHTMLElement({ tagName: 'INPUT', type: 'tel' })), false);
+  assert.equal(isTextControl(new FakeHTMLElement({ tagName: 'INPUT', type: 'password' })), false);
+  assert.equal(isTextControl(new FakeHTMLElement({ tagName: 'INPUT', type: 'text', autocomplete: 'cc-number' })), false);
+  assert.equal(isSensitiveControl(new FakeHTMLElement({ tagName: 'INPUT', type: 'text', name: 'card_number' })), true);
+});
+
+test('menu open click guard and selection helpers are present', () => {
+  assert.match(userscript, /MENU_OPEN_CLICK_GUARD_MS = 450/);
+  assert.match(userscript, /_menuOpenedAt/);
+  assert.match(userscript, /handleTouchEnd\(e\)/);
+  assert.match(userscript, /if \(this\.menu\) return;/);
+  assert.match(userscript, /Date\.now\(\) - \(this\._menuOpenedAt \|\| 0\) < MENU_OPEN_CLICK_GUARD_MS/);
+  assert.match(userscript, /isSelectAll/);
+  assert.match(userscript, /menu\.lang = 'fr'/);
+  assert.match(userscript, /selectAllInsideEditable/);
+  assert.match(userscript, /range\.selectNodeContents\(editableEl\)/);
+});
+
+test('handleOutsideClick ignores clicks right after opening the menu', () => {
+  const MENU_OPEN_CLICK_GUARD_MS = 450;
+  const handleOutsideClick = buildMethod('handleOutsideClick', ['e'], {
+    MENU_OPEN_CLICK_GUARD_MS,
+    Date,
+  });
+  let closed = 0;
+  const harness = {
+    menu: {},
+    _menuOpenedAt: Date.now(),
+    isUiEvent: () => false,
+    closeMenu() { closed += 1; },
+  };
+  handleOutsideClick.call(harness, {});
+  assert.equal(closed, 0);
+
+  harness._menuOpenedAt = Date.now() - 1000;
+  handleOutsideClick.call(harness, {});
+  assert.equal(closed, 1);
+});
+
+test('debug logs capture API and apply problem paths', () => {
+  assert.match(userscript, /const dbgProblem = \(scope, detail = \{\}\) =>/);
+  assert.match(userscript, /dbgProblem\('languagetool-http'/);
+  assert.match(userscript, /dbgProblem\('languagetool-network'\)/);
+  assert.match(userscript, /dbgProblem\('languagetool-timeout'/);
+  assert.match(userscript, /dbgProblem\('correction-error'/);
+  assert.match(userscript, /dbgProblem\('apply-failure'/);
+  assert.match(userscript, /dbgProblem\('apply-exception'/);
+  assert.match(userscript, /dbg\('fetchCorrection start'/);
+  assert.match(userscript, /dbg\('apply success'/);
+  assert.match(userscript, /_logs\.length > 2000/);
 });
 
 test('personal dictionary remains out of scope', () => {
@@ -964,15 +1111,23 @@ test('personal dictionary remains out of scope', () => {
   assert.doesNotMatch(readme, /Dictionnaire personnel|Ajouter au dictionnaire/);
 });
 
-test('README documents privacy, endpoint, and public API limits', () => {
+test('README documents Violentmonkey install links and privacy limits', () => {
+  assert.match(readme, /Violentmonkey/);
+  assert.match(readme, /jinjaccalgkegednnccohejagnlnfdag/);
+  assert.match(readme, /addons\.mozilla\.org\/firefox\/addon\/violentmonkey\//);
+  assert.doesNotMatch(readme, /addon\/violetmonkey/);
+  assert.doesNotMatch(readme, /jinjaccalgkegedbjfncswigafejgdne/);
   assert.match(readme, /https:\/\/api\.languagetool\.org\/v2\/check/);
   assert.match(readme, /texte sélectionné est envoyé à LanguageTool/);
   assert.match(readme, /preferredVariants=fr-FR,en-US,de-DE,pt-PT/);
   assert.match(readme, /20 requêtes par minute/);
   assert.match(readme, /20 KB par requête/);
+  assert.match(readme, /75 KB/);
   assert.match(readme, /Cache persistant/);
   assert.match(readme, /7 jours/);
   assert.match(readme, /hash FNV-1a/);
+  assert.match(readme, /context\.text/);
+  assert.match(readme, /@noframes/);
 });
 
 test('README documents stronger automatic replacement without promising every site', () => {

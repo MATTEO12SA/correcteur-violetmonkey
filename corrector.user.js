@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name           Correcteur de Phrases
-// @namespace      http://violetmonkey.net/
-// @version        4.11.0
+// @namespace      https://github.com/MATTEO12SA/correcteur-violetmonkey
+// @version        4.12.0
 // @description    Corrige automatiquement les phrases sélectionnées via LanguageTool
 // @author         Matteo12SA
+// @homepageURL    https://github.com/MATTEO12SA/correcteur-violetmonkey
+// @supportURL     https://github.com/MATTEO12SA/correcteur-violetmonkey/issues
 // @match          *://*/*
 // @noframes
 // @updateURL      https://raw.githubusercontent.com/MATTEO12SA/correcteur-violetmonkey/main/corrector.user.js
@@ -11,7 +13,6 @@
 // @grant          GM_xmlhttpRequest
 // @grant          GM_setValue
 // @grant          GM_getValue
-// @grant          GM_deleteValue
 // @grant          GM_setClipboard
 // @connect        api.languagetool.org
 // @run-at         document-end
@@ -27,10 +28,18 @@
   const UI_ROOT_ID = '__corrector_violetmonkey_root';
   const NAV_EVENT = '_corrector_nav';
   const HISTORY_PATCH_FLAG = '__corrector_history_patched';
-  // 'password' volontairement exclu : envoyer un mot de passe à LanguageTool serait une fuite de credential.
-  const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url', 'tel', 'email']);
+  // password / email / tel / payment exclus : ne pas envoyer de données sensibles à LanguageTool.
+  const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url']);
+  const SENSITIVE_AUTOCOMPLETE = new Set([
+    'email', 'tel', 'phone', 'mobile', 'username', 'current-password', 'new-password',
+    'cc-number', 'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year', 'cc-name',
+    'cc-type', 'transaction-amount', 'transaction-currency', 'one-time-code',
+  ]);
   const CORRECTION_MODES = new Set(['chat-lite', 'balanced', 'strict']);
   const DEFAULT_CORRECTION_MODE = 'balanced';
+  const SCRIPT_USER_AGENT = 'CorrecteurDePhrases/4.12.0 (Violentmonkey; +https://github.com/MATTEO12SA/correcteur-violetmonkey)';
+  const MENU_OPEN_CLICK_GUARD_MS = 450;
+  const APPLY_CONFIRM_DELAY_MS = 120;
   const HOST_CHAT_REGEX = /(?:^|\.)(?:twitch|kick|discord|slack|telegram|messenger|teams|irccloud|chat)\./i;
   const WORD_TOKEN_REGEX = /[\p{L}\p{N}]+(?:[’'-][\p{L}\p{N}]+)*/gu;
   const LETTER_REGEX = /\p{L}/gu;
@@ -51,6 +60,7 @@
   const LANGUAGETOOL_TIMEOUT_MS = 12000;
   const LANGUAGETOOL_MAX_TEXT_CHARS = 20000;
   const LANGUAGETOOL_SAFE_MAX_BYTES = 19000;
+  const LANGUAGETOOL_MAX_BYTES_PER_MINUTE = 75000;
   const LANGUAGETOOL_RATE_LIMIT_COOLDOWN_MS = 60000;
   const LANGUAGETOOL_ATTRIBUTION_URL = 'https://languagetool.org';
   const COPY_RESET_DELAY_MS = 1500;
@@ -62,14 +72,14 @@
     noCorrection: 'Aucune correction nécessaire.',
     applyGenericFailure: 'Impossible de remplacer sur ce site. Utilisez "Copier".',
     selectionLost: 'Sélection perdue. Resélectionnez le texte.',
-    selectionChanged: 'La sélection a changé depuis la correction. Sélectionne à nouveau le texte.',
+    selectionChanged: 'La sélection a changé depuis la correction. Sélectionnez à nouveau le texte.',
     fieldRefusedReplacement: 'Ce champ n’est pas modifiable automatiquement. Utilisez "Copier".',
     staticReplacementUnconfirmed: 'Remplacement non confirmé sur cette page. Utilisez "Copier".',
     editorReplacementUnconfirmed: 'Remplacement non confirmé sur cet éditeur. Utilisez "Copier".',
     editorWholeReplaceFailure: 'Impossible de remplacer sur cet éditeur. Utilisez "Copier".',
     editorPartialReplaceFailure: 'Remplacement partiel non fiable sur cet éditeur. Utilisez "Copier" ou sélectionnez tout le texte.',
     replacementCopied: 'Remplacement impossible sur ce champ. La correction a été copiée automatiquement.',
-    replacementCopyFailure: 'Remplacement impossible sur ce champ. Utilise le bouton Copier pour récupérer la correction.',
+    replacementCopyFailure: 'Remplacement impossible sur ce champ. Utilisez le bouton Copier pour récupérer la correction.',
     networkError: 'Erreur réseau : impossible de joindre LanguageTool.',
     timeout: 'Délai dépassé. Réessayez avec un passage plus court.',
     invalidResponse: 'Réponse LanguageTool illisible. Réessayez plus tard.',
@@ -100,8 +110,8 @@
   // U+202A-U+202E : RTL/LTR overrides (peuvent inverser visuellement le texte)
   // U+2066-U+2069 : isolates bidi
   // U+FEFF : BOM
-  const DANGEROUS_UNICODE_REGEX = /[​-\u200F\u202A-\u202E\u2066-\u2069﻿]/;
-  const ZALGO_COMBINER_REGEX = /[̀-ͯ]{4,}/;
+  const DANGEROUS_UNICODE_REGEX = /[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/;
+  const ZALGO_COMBINER_REGEX = /[\u0300-\u036f]{4,}/;
 
   const isSafeReplacement = (val) => {
     if (typeof val !== 'string') return false;
@@ -170,6 +180,40 @@
     return (h >>> 0).toString(36);
   };
 
+  const sanitizeCachedMatches = (matches) => {
+    if (!Array.isArray(matches)) return null;
+    return matches.map((match) => {
+      if (!match || typeof match !== 'object') return null;
+      const offset = Number(match.offset);
+      const length = Number(match.length);
+      if (!Number.isInteger(offset) || !Number.isInteger(length) || offset < 0 || length < 0) return null;
+      const replacements = Array.isArray(match.replacements)
+        ? match.replacements
+          .filter((item) => item && typeof item.value === 'string')
+          .slice(0, 5)
+          .map((item) => ({ value: item.value }))
+        : [];
+      if (!replacements.length) return null;
+      const rule = match.rule && typeof match.rule === 'object'
+        ? {
+            id: String(match.rule.id || ''),
+            issueType: String(match.rule.issueType || ''),
+            category: {
+              id: String(match.rule.category?.id || ''),
+            },
+          }
+        : undefined;
+      return {
+        offset,
+        length,
+        message: typeof match.message === 'string' ? match.message : '',
+        replacements,
+        ...(rule ? { rule } : {}),
+        ...(match.type?.typeName ? { type: { typeName: String(match.type.typeName) } } : {}),
+      };
+    }).filter(Boolean);
+  };
+
   const persistCacheLoad = () => {
     if (typeof GM_getValue !== 'function') return new Map();
     try {
@@ -183,7 +227,9 @@
         const [key, entry] = item;
         if (typeof key !== 'string' || !entry || typeof entry.t !== 'number') continue;
         if (now - entry.t > CORRECTION_CACHE_TTL_MS) continue;
-        cache.set(key, entry);
+        const sanitized = sanitizeCachedMatches(entry.v);
+        if (!sanitized) continue;
+        cache.set(key, { v: sanitized, t: entry.t });
       }
       return cache;
     } catch (_) {
@@ -213,8 +259,10 @@
   };
 
   const lruCacheSet = (cache, key, value) => {
+    const sanitized = sanitizeCachedMatches(value);
+    if (!sanitized) return;
     if (cache.has(key)) cache.delete(key);
-    cache.set(key, { v: value, t: Date.now() });
+    cache.set(key, { v: sanitized, t: Date.now() });
     while (cache.size > CORRECTION_CACHE_MAX) {
       const oldest = cache.keys().next().value;
       cache.delete(oldest);
@@ -222,7 +270,7 @@
     persistCacheSave(cache);
   };
 
-  const copyTextToClipboard = async (text) => {
+  const copyTextToClipboard = async (text, shadowRoot = null) => {
     const value = String(text || '');
     if (!value) return false;
     if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
@@ -239,11 +287,15 @@
       } catch (_) {}
     }
 
+    const mount = shadowRoot || document.body || document.documentElement;
+    if (!mount) return false;
     const ta = document.createElement('textarea');
     ta.value = value;
     ta.setAttribute('readonly', '');
-    ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0';
-    document.body.appendChild(ta);
+    ta.setAttribute('aria-hidden', 'true');
+    ta.tabIndex = -1;
+    ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none';
+    mount.appendChild(ta);
     ta.select();
     ta.setSelectionRange(0, value.length);
     let ok = false;
@@ -258,6 +310,13 @@
 
   const readStoredFlag = (key) => {
     try {
+      if (typeof GM_getValue === 'function') {
+        const gmValue = GM_getValue(key, null);
+        if (gmValue === true || gmValue === '1' || gmValue === 1) return true;
+        if (gmValue === false || gmValue === '0' || gmValue === 0) return false;
+      }
+    } catch (_) {}
+    try {
       return localStorage.getItem(key) === '1';
     } catch (_) {
       return false;
@@ -266,12 +325,23 @@
 
   const writeStoredFlag = (key, enabled) => {
     try {
+      if (typeof GM_setValue === 'function') {
+        GM_setValue(key, enabled ? '1' : '0');
+      }
+    } catch (_) {}
+    try {
       if (enabled) localStorage.setItem(key, '1');
       else localStorage.removeItem(key);
     } catch (_) {}
   };
 
   const readStoredValue = (key, fallback = '') => {
+    try {
+      if (typeof GM_getValue === 'function') {
+        const gmValue = GM_getValue(key, null);
+        if (gmValue != null && gmValue !== '') return String(gmValue);
+      }
+    } catch (_) {}
     try {
       const value = localStorage.getItem(key);
       return value == null ? fallback : value;
@@ -281,6 +351,12 @@
   };
 
   const writeStoredValue = (key, value) => {
+    try {
+      if (typeof GM_setValue === 'function') {
+        if (value == null || value === '') GM_setValue(key, '');
+        else GM_setValue(key, String(value));
+      }
+    } catch (_) {}
     try {
       if (value == null || value === '') localStorage.removeItem(key);
       else localStorage.setItem(key, value);
@@ -304,8 +380,25 @@
     : DEFAULT_CORRECTION_MODE;
   const _logs = [];
 
+  const isSensitiveControl = (el) => {
+    if (!el || !(el instanceof HTMLElement)) return true;
+    const type = (el.type || '').toLowerCase();
+    if (type === 'password' || type === 'email' || type === 'tel' || type === 'hidden') return true;
+    const autocomplete = String(el.getAttribute('autocomplete') || '').toLowerCase();
+    if (autocomplete) {
+      const tokens = autocomplete.split(/\s+/).filter(Boolean);
+      if (tokens.some((token) => SENSITIVE_AUTOCOMPLETE.has(token))) return true;
+    }
+    const name = String(el.getAttribute('name') || el.id || '').toLowerCase();
+    if (/(?:^|[_-])(?:password|passwd|pwd|email|e-mail|phone|tel|card|cc|cvv|cvc|ssn)(?:$|[_-])/i.test(name)) {
+      return true;
+    }
+    return false;
+  };
+
   const isTextControl = (el) => {
     if (!el || !(el instanceof HTMLElement)) return false;
+    if (isSensitiveControl(el)) return false;
     if (el.tagName === 'TEXTAREA') return true;
     if (el.tagName !== 'INPUT') return false;
     return TEXT_INPUT_TYPES.has((el.type || 'text').toLowerCase());
@@ -340,6 +433,11 @@
     if (!debugEnabled) return;
     const line = a.map(x => (typeof x === 'object' ? JSON.stringify(x) : String(x))).join(' ');
     _logs.push(new Date().toISOString().slice(11, 23) + ' ' + line);
+    if (_logs.length > 2000) _logs.splice(0, _logs.length - 2000);
+  };
+
+  const dbgProblem = (scope, detail = {}) => {
+    dbg('PROBLEM', scope, detail);
   };
 
   // Snapshot complet de l'état du DOM + sélection à un instant T
@@ -442,8 +540,11 @@
     _correctionRequestToken: 0,
     _languageToolCooldownUntil: 0,
     _lt_requestTimestamps: [],
+    _lt_requestByteWindow: [],
     _activeApplyToken: 0,
     _applyTimeouts: new Set(),
+    _menuOpenedAt: 0,
+    _navHandler: null,
 
     beginApplyFlow() {
       this.cancelPendingApplyFlow();
@@ -543,8 +644,8 @@
       if (downloadBtn) downloadBtn.disabled = !debugEnabled;
       if (status) {
         status.textContent = debugEnabled
-          ? (_logs.length ? 'Logs actifs. Clique sur "Télécharger les logs" après avoir reproduit le bug.' : 'Logs actifs. Reproduis le bug puis télécharge le fichier.')
-          : 'Logs désactivés. Active-les ici si tu veux un fichier de debug.';
+          ? (_logs.length ? 'Logs actifs. Cliquez sur "Télécharger les logs" après avoir reproduit le bug.' : 'Logs actifs. Reproduisez le bug puis téléchargez le fichier.')
+          : 'Logs désactivés. Activez-les ici si vous voulez un fichier de debug.';
       }
     },
 
@@ -603,9 +704,13 @@
           'all: initial',
           'display: block',
           'position: fixed',
-          'inset: 0',
+          'left: 0',
+          'top: 0',
+          'width: 0',
+          'height: 0',
           'z-index: 2147483647',
           'pointer-events: none',
+          'overflow: visible',
           'color-scheme: light dark',
         ].join(';');
         (document.body || document.documentElement).appendChild(host);
@@ -722,6 +827,7 @@
       this._throttledScroll = throttle(() => this.handlePillScroll(), 100);
 
       bind(document, 'mouseup',         (e) => this.handleMouseUp(e));
+      bind(document, 'touchend',        (e) => this.handleTouchEnd(e), { passive: true });
       bind(document, 'keyup',           (e) => this.handleKeyUp(e));
       bind(document, 'selectionchange', ()  => this.handleSelectionChange());
       bind(document, 'click',           (e) => this.handleOutsideClick(e));
@@ -743,6 +849,10 @@
         target.removeEventListener(evt, handler, opts);
       }
       this._boundListeners = [];
+      if (this._navHandler) {
+        window.removeEventListener(NAV_EVENT, this._navHandler);
+        this._navHandler = null;
+      }
       this._styleObserver?.disconnect();
       this._styleObserver = null;
       this.abortCurrentRequest();
@@ -769,7 +879,10 @@
         window.addEventListener('popstate', () => window.dispatchEvent(new Event(NAV_EVENT)));
       }
 
-      window.addEventListener(NAV_EVENT, () => { this.hidePill(); this.closeMenu(); });
+      if (!this._navHandler) {
+        this._navHandler = () => { this.hidePill(); this.closeMenu(); };
+        window.addEventListener(NAV_EVENT, this._navHandler);
+      }
 
       if (this._styleObserver) return;
       this._styleObserver = new MutationObserver(() => {
@@ -780,7 +893,8 @@
           this.ensureUiRoot();
         }
       });
-      this._styleObserver.observe(document.body || document.documentElement, { childList: true });
+      const observeTarget = document.documentElement || document.body;
+      this._styleObserver.observe(observeTarget, { childList: true, subtree: true });
     },
 
     // ─────────────────────────────────────────────
@@ -788,16 +902,26 @@
     // ─────────────────────────────────────────────
     handleMouseUp(e) {
       if (this.isUiEvent(e)) return;
+      if (this.menu) return;
       setTimeout(() => this._checkSelectionAndShowPill(), 10);
     },
 
-    // Affiche la bulle après sélection clavier (Shift+flèche, Shift+End, etc.)
+    handleTouchEnd(e) {
+      if (this.isUiEvent(e)) return;
+      if (this.menu) return;
+      setTimeout(() => this._checkSelectionAndShowPill(), 30);
+    },
+
+    // Affiche la bulle après sélection clavier (Shift+flèche, Ctrl+A, etc.)
     handleKeyUp(e) {
-      if (!e.shiftKey) return;
+      if (this.menu) return;
+      const isSelectAll = (e.key === 'a' || e.key === 'A') && (e.ctrlKey || e.metaKey);
+      if (!e.shiftKey && !isSelectAll) return;
       setTimeout(() => this._checkSelectionAndShowPill(), 10);
     },
 
     _checkSelectionAndShowPill() {
+      if (this.menu) return;
       const context = this.getSelectionContext();
       if (!context) { this.hidePill(); return; }
       this.showPill(context);
@@ -807,16 +931,20 @@
     handleSelectionChange() {
       clearTimeout(this._selChangeTid);
       this._selChangeTid = setTimeout(() => {
-        if (!this.getSelectionContext()) this.hidePill();
+        if (this.menu) return;
+        if (this.getSelectionContext()) this._checkSelectionAndShowPill();
+        else this.hidePill();
       }, 40);
     },
 
     showPill(context) {
+      if (this.menu) return;
       this.hidePill();
       this._pillSelectionContext = context;
       const { rect } = context;
       const pill = document.createElement('button');
       pill.className = 'corrector-pill';
+      pill.type = 'button';
       pill.setAttribute('aria-label', 'Corriger le texte sélectionné');
       pill.textContent = '\u270E Corriger';
       pill.style.visibility = 'hidden';
@@ -824,7 +952,12 @@
       pill.style.top = '0px';
       pill.addEventListener('mousedown', (e) => {
         e.preventDefault();
+        e.stopPropagation();
         if (e.button === 0) this.triggerCorrection(this._pillSelectionContext);
+      });
+      pill.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
       });
       pill.addEventListener('keydown', (e) => {
         if (e.key !== 'Enter' && e.key !== ' ') return;
@@ -915,6 +1048,7 @@
       const savedPos = this.loadPosition();
 
       this.hidePill();
+      this._menuOpenedAt = Date.now();
       this.createMenu(
         savedPos ? savedPos.x : (pillRect ? pillRect.left : 80),
         savedPos ? savedPos.y : (pillRect ? pillRect.bottom + 10 : 80)
@@ -925,10 +1059,10 @@
     // ─────────────────────────────────────────────
     // API LanguageTool
     // ─────────────────────────────────────────────
-    createCorrectionContext(text) {
+    createCorrectionContext(text, selectionContext = null) {
       const host = (window.location.hostname || '').toLowerCase();
       const source = text || '';
-      const language = this.detectLanguageHint() || 'auto';
+      const language = this.detectLanguageHint(selectionContext || this.selectionSource) || 'auto';
       const key = `${host}||${correctionMode}||${language}||${source.length}||${hashFNV1a(source)}`;
       if (this._contextCache.has(key)) return this._contextCache.get(key);
 
@@ -1231,18 +1365,25 @@
       this._languageToolCooldownUntil = Date.now() + LANGUAGETOOL_RATE_LIMIT_COOLDOWN_MS;
     },
 
-    canMakeLanguageToolRequest() {
+    canMakeLanguageToolRequest(textByteLength = 0) {
       const now = Date.now();
       this._lt_requestTimestamps = this._lt_requestTimestamps.filter(t => now - t < 60000);
-      return this._lt_requestTimestamps.length < 20;
+      this._lt_requestByteWindow = (this._lt_requestByteWindow || []).filter((item) => now - item.t < 60000);
+      const usedBytes = this._lt_requestByteWindow.reduce((sum, item) => sum + item.bytes, 0);
+      if (this._lt_requestTimestamps.length >= 20) return false;
+      if (usedBytes + textByteLength > LANGUAGETOOL_MAX_BYTES_PER_MINUTE) return false;
+      return true;
     },
 
-    recordLanguageToolRequest() {
-      this._lt_requestTimestamps.push(Date.now());
+    recordLanguageToolRequest(textByteLength = 0) {
+      const now = Date.now();
+      this._lt_requestTimestamps.push(now);
+      this._lt_requestByteWindow.push({ t: now, bytes: textByteLength });
     },
 
-    detectLanguageHint() {
-      const rawLang = (document.documentElement?.lang || '').toLowerCase().replace('_', '-');
+    mapLanguageCode(rawLang) {
+      const normalized = String(rawLang || '').toLowerCase().replace('_', '-').trim();
+      if (!normalized) return null;
       const exactMap = {
         'en-us': 'en-US',
         'en-gb': 'en-GB',
@@ -1255,9 +1396,13 @@
         'de-ch': 'de-CH',
         'pt-pt': 'pt-PT',
         'pt-br': 'pt-BR',
+        'fr-fr': 'fr',
+        'fr-ca': 'fr',
+        'fr-be': 'fr',
+        'fr-ch': 'fr',
       };
-      if (exactMap[rawLang]) return exactMap[rawLang];
-      const lang = rawLang.split('-')[0];
+      if (exactMap[normalized]) return exactMap[normalized];
+      const lang = normalized.split('-')[0];
       const map = {
         fr: 'fr',
         en: 'en-US',
@@ -1271,10 +1416,36 @@
       return map[lang] || null;
     },
 
+    detectLanguageHint(selectionContext = null) {
+      const source = selectionContext || this.selectionSource;
+      const candidates = [];
+      if (source?.type === 'control' && source.el instanceof HTMLElement) {
+        candidates.push(source.el);
+      }
+      if (source?.type === 'range') {
+        const anchor = source.range?.commonAncestorContainer;
+        const el = anchor?.nodeType === Node.TEXT_NODE ? anchor.parentElement : anchor;
+        if (el instanceof HTMLElement) candidates.push(el);
+      }
+      if (source?.editableEl instanceof HTMLElement) candidates.push(source.editableEl);
+      if (source?.activeElement instanceof HTMLElement) candidates.push(source.activeElement);
+
+      for (const el of candidates) {
+        const local = el.closest('[lang]');
+        if (local) {
+          const mapped = this.mapLanguageCode(local.getAttribute('lang'));
+          if (mapped) return mapped;
+        }
+      }
+
+      // Prefer auto so page UI language (often en) does not force wrong grammar checks.
+      return null;
+    },
+
     buildLanguageToolPayload(text, context) {
       const params = new URLSearchParams({
         text,
-        language: context.language || this.detectLanguageHint() || 'auto',
+        language: context.language || 'auto',
         preferredVariants: LANGUAGETOOL_PREFERRED_VARIANTS,
         level: context.mode === 'strict' ? 'picky' : 'default',
       });
@@ -1300,7 +1471,16 @@
       this.abortCurrentRequest();
       const requestToken = ++this._correctionRequestToken;
 
-      const correctionContext = this.createCorrectionContext(text);
+      const correctionContext = this.createCorrectionContext(text, this.selectionSource);
+      dbg('fetchCorrection start', {
+        chars: (text || '').length,
+        bytes: getUtf8ByteLength(text),
+        mode: correctionContext.mode,
+        language: correctionContext.language,
+        host: correctionContext.host,
+        sourceType: this.selectionSource?.type || null,
+        sourceKind: this.selectionSource?.kind || null,
+      });
       const limitError = this.getTextLimitError(text);
       if (limitError) {
         this.showCorrectionError(limitError, { retry: false, kind: 'limit' });
@@ -1310,6 +1490,7 @@
       const cacheKey = this.buildCorrectionCacheKey(text, correctionContext);
       const cached = lruCacheGet(this.correctionCache, cacheKey);
       if (cached) {
+        dbg('fetchCorrection cache-hit', { matches: cached.length, key: cacheKey });
         this.renderCorrection(text, cached, correctionContext);
         return;
       }
@@ -1320,14 +1501,15 @@
         return;
       }
 
-      if (!this.canMakeLanguageToolRequest()) {
+      const textBytes = getUtf8ByteLength(text);
+      if (!this.canMakeLanguageToolRequest(textBytes)) {
         this.showCorrectionError(
-          'Limite locale atteinte (20 req/min). Patientez quelques secondes.',
+          'Limite locale atteinte (20 req/min ou 75 Ko/min). Patientez quelques secondes.',
           { retry: false, kind: 'rate-limit' }
         );
         return;
       }
-      this.recordLanguageToolRequest();
+      this.recordLanguageToolRequest(textBytes);
 
       this.setLoadingState(true);
 
@@ -1337,6 +1519,7 @@
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
           'Accept': 'application/json',
+          'User-Agent': SCRIPT_USER_AGENT,
         },
         data:    this.buildLanguageToolPayload(text, correctionContext),
         timeout: LANGUAGETOOL_TIMEOUT_MS,
@@ -1347,6 +1530,7 @@
           this.setLoadingState(false);
           if (res.status < 200 || res.status >= 300) {
             if (res.status === 429) this.startLanguageToolCooldown();
+            dbgProblem('languagetool-http', { status: res.status, bytes: textBytes });
             this.showCorrectionError(this.getLanguageToolErrorMessage(res.status), {
               retry: res.status !== 429,
               kind: res.status === 429 ? 'rate-limit' : (res.status === 413 ? 'limit' : 'error'),
@@ -1356,30 +1540,56 @@
           try {
             const ctype = (res.responseHeaders || '').toLowerCase();
             if (ctype && !ctype.includes('application/json')) {
+              dbgProblem('languagetool-invalid-content-type', { headers: (res.responseHeaders || '').slice(0, 200) });
               this.showCorrectionError(USER_MESSAGES.invalidResponse, { kind: 'error' });
               return;
             }
-            const matches = JSON.parse(res.responseText).matches || [];
+            const parsed = JSON.parse(res.responseText);
+            const matches = this.normalizeLanguageToolMatches(parsed?.matches, text);
+            dbg('fetchCorrection success', {
+              rawMatches: Array.isArray(parsed?.matches) ? parsed.matches.length : -1,
+              keptMatches: matches.length,
+            });
             lruCacheSet(this.correctionCache, cacheKey, matches);
             this.renderCorrection(text, matches, correctionContext);
           }
-          catch (_) { this.showCorrectionError(USER_MESSAGES.invalidResponse, { kind: 'error' }); }
+          catch (err) {
+            dbgProblem('languagetool-parse', { message: err?.message || String(err) });
+            this.showCorrectionError(USER_MESSAGES.invalidResponse, { kind: 'error' });
+          }
         },
         onerror: () => {
           if (requestToken !== this._correctionRequestToken || !this.menu) return;
           this.currentRequest = null;
           this.setLoadingState(false);
+          dbgProblem('languagetool-network');
           this.showCorrectionError(USER_MESSAGES.networkError, { kind: 'network' });
         },
         ontimeout: () => {
           if (requestToken !== this._correctionRequestToken || !this.menu) return;
           this.currentRequest = null;
           this.setLoadingState(false);
+          dbgProblem('languagetool-timeout', { timeoutMs: LANGUAGETOOL_TIMEOUT_MS });
           this.showCorrectionError(USER_MESSAGES.timeout, { kind: 'timeout' });
         },
         onabort: () => {
           if (requestToken === this._correctionRequestToken) this.currentRequest = null;
+          dbg('fetchCorrection aborted', { requestToken });
         },
+      });
+    },
+
+    normalizeLanguageToolMatches(matches, text) {
+      if (!Array.isArray(matches)) return [];
+      const source = text || '';
+      const max = source.length;
+      return matches.filter((match) => {
+        if (!match || typeof match !== 'object') return false;
+        const offset = Number(match.offset);
+        const length = Number(match.length);
+        if (!Number.isInteger(offset) || !Number.isInteger(length)) return false;
+        if (offset < 0 || length < 0 || offset > max || offset + length > max) return false;
+        return Array.isArray(match.replacements) && match.replacements.length > 0;
       });
     },
 
@@ -1387,6 +1597,7 @@
       const refs = this.getMenuRefs();
       const el = refs?.correctionContent;
       if (!el) return;
+      el.setAttribute('aria-busy', loading ? 'true' : 'false');
       if (loading) {
         this.resetActionState();
         el.dataset.correctorState = 'loading';
@@ -1417,6 +1628,7 @@
       const label = msg || 'Erreur : impossible de corriger.';
       const retry = options.retry !== false;
       const kind = options.kind || 'error';
+      dbgProblem('correction-error', { kind, retry, message: label });
       el.dataset.correctorState = kind;
       el.classList.remove(
         'corrector-state-loading',
@@ -1506,7 +1718,9 @@
         const applyBtn = refs.applyBtn;
         applyBtn.disabled = false;
         applyBtn.dataset.corrected = corrected;
-        applyBtn.focus();
+        requestAnimationFrame(() => {
+          if (this.menu && refs.applyBtn && !refs.applyBtn.disabled) refs.applyBtn.focus();
+        });
 
         const copyBtn = refs.copyBtn;
         copyBtn.style.display = 'inline-block';
@@ -1687,8 +1901,10 @@
     // ─────────────────────────────────────────────
     createMenu(x, y) {
       this.closeMenu();
+      this._menuOpenedAt = Date.now();
       const menu = document.createElement('div');
       menu.className = 'text-corrector-menu';
+      menu.lang = 'fr';
       menu.setAttribute('role', 'dialog');
       menu.setAttribute('aria-modal', 'true');
       menu.setAttribute('aria-labelledby', 'corrector-title');
@@ -1713,6 +1929,15 @@
         '    </select>',
         '    <span class="corrector-mode-help" id="corrector-mode-help"></span>',
         '  </label>',
+        '  <div class="corrector-setting-stack">',
+        '    <span id="corrector-position-label">Position du panneau</span>',
+        '    <div class="corrector-position-actions" role="group" aria-labelledby="corrector-position-label">',
+        '      <button type="button" class="corrector-position-btn" data-pos="top-left">Haut gauche</button>',
+        '      <button type="button" class="corrector-position-btn" data-pos="top-right">Haut droite</button>',
+        '      <button type="button" class="corrector-position-btn" data-pos="bottom-left">Bas gauche</button>',
+        '      <button type="button" class="corrector-position-btn" data-pos="bottom-right">Bas droite</button>',
+        '    </div>',
+        '  </div>',
         '  <label class="corrector-setting-row">',
         '    <input type="checkbox" class="corrector-setting-debug">',
         '    <span>Activer les logs de debug</span>',
@@ -1726,11 +1951,11 @@
         '</div>',
         '<div class="corrector-section">',
         '  <div class="corrector-label" id="corrector-original-label">Texte sélectionné</div>',
-        '  <div class="corrector-original-content" aria-labelledby="corrector-original-label"></div>',
+        '  <div class="corrector-original-content" tabindex="0" aria-labelledby="corrector-original-label"></div>',
         '</div>',
         '<div class="corrector-section">',
         '  <div class="corrector-label" id="corrector-correction-label">Correction suggérée</div>',
-        '  <div class="corrector-correction-content corrector-state corrector-state-loading" role="status" aria-live="polite" aria-atomic="true" aria-labelledby="corrector-correction-label" data-corrector-state="loading">',
+        '  <div class="corrector-correction-content corrector-state corrector-state-loading" tabindex="0" role="status" aria-live="polite" aria-atomic="true" aria-busy="true" aria-labelledby="corrector-correction-label" data-corrector-state="loading">',
         '    <span class="corrector-spinner" aria-hidden="true"></span>',
         '    <span>' + USER_MESSAGES.loading + '</span>',
         '  </div>',
@@ -1760,7 +1985,7 @@
         const txt = e.currentTarget.dataset.text;
         if (!txt) return;
         const btn = e.currentTarget;
-        const copied = await copyTextToClipboard(txt);
+        const copied = await copyTextToClipboard(txt, this.uiRoot);
         if (!copied) {
           this.showApplyError(USER_MESSAGES.copyFailure);
           return;
@@ -1785,6 +2010,9 @@
         this.setCorrectionMode(e.currentTarget.value);
       });
       refs.downloadLogsBtn.addEventListener('click', () => downloadLogs());
+      menu.querySelectorAll('.corrector-position-btn').forEach((btn) => {
+        btn.addEventListener('click', () => this.moveMenuToCorner(btn.dataset.pos));
+      });
       menu.addEventListener('keydown', (e) => this.handleMenuKeyDown(e));
 
       this.ensureUiRoot().appendChild(menu);
@@ -1800,6 +2028,25 @@
         this.adjustMenuPosition(menu, true);
         refs.cancelBtn.focus();
       });
+    },
+
+    moveMenuToCorner(corner) {
+      if (!this.menu) return;
+      const margin = 8;
+      const width = this.menu.offsetWidth || 360;
+      const height = this.menu.offsetHeight || 200;
+      const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+      const maxTop = Math.max(margin, window.innerHeight - height - margin);
+      const positions = {
+        'top-left': { x: margin, y: margin },
+        'top-right': { x: maxLeft, y: margin },
+        'bottom-left': { x: margin, y: maxTop },
+        'bottom-right': { x: maxLeft, y: maxTop },
+      };
+      const pos = positions[corner] || positions['top-right'];
+      this.menu.style.left = `${pos.x}px`;
+      this.menu.style.top = `${pos.y}px`;
+      this.savePosition(pos.x, pos.y);
     },
 
     // ─────────────────────────────────────────────
@@ -1868,12 +2115,14 @@
     },
 
     savePosition(x, y) {
-      try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ x, y })); } catch (_) {}
+      writeStoredValue(STORAGE_KEY, JSON.stringify({ x, y }));
     },
 
     loadPosition() {
       try {
-        const p = JSON.parse(localStorage.getItem(STORAGE_KEY));
+        const raw = readStoredValue(STORAGE_KEY, '');
+        if (!raw) return null;
+        const p = JSON.parse(raw);
         if (p && typeof p.x === 'number' && typeof p.y === 'number') return p;
       } catch (_) {}
       return null;
@@ -1910,125 +2159,6 @@
       menu.style.left = pos.x + 'px';
       menu.style.top = pos.y + 'px';
       if (persist) this.savePosition(pos.x, pos.y);
-    },
-
-    tryDraftReactWholeEditorReplacement(editableEl, replacementText, originalEditableText, applyToken, finalize, onNoChange) {
-      try {
-        const allKeys = Object.getOwnPropertyNames(editableEl);
-        // React 16 : __reactInternalInstance$, React 17/18 : __reactFiber$ + __reactProps$.
-        const rKey = allKeys.find(k =>
-          k.startsWith('__reactFiber') ||
-          k.startsWith('__reactInternalInstance') ||
-          k.startsWith('__reactProps')
-        );
-        dbg('fiber: rKey=' + (rKey ? rKey.slice(0, 30) : 'null'));
-        if (!rKey) return false;
-
-        const isES = (v) => v && typeof v === 'object' && (
-          (typeof v.getSelection === 'function' && typeof v.getCurrentContent === 'function') ||
-          (typeof v.get === 'function' && typeof v.merge === 'function' && typeof v.set === 'function')
-        );
-
-        let fiber = editableEl[rKey];
-        // Si on a attrapé __reactProps, retrouver le Fiber sibling (où vivent memoizedProps).
-        if (rKey.startsWith('__reactProps')) {
-          const fiberKey = allKeys.find(k => k.startsWith('__reactFiber'));
-          if (!fiberKey) return false;
-          fiber = editableEl[fiberKey];
-        }
-        let depth = 0;
-        let draftProps = null;
-
-        while (fiber && depth < 300 && !draftProps) {
-          const p = fiber.memoizedProps;
-          if (p && typeof p === 'object') {
-            for (const k of Object.keys(p)) {
-              if (isES(p[k])) {
-                const onCh = typeof p.onChange === 'function' ? p.onChange
-                           : typeof p.onEditorStateChange === 'function' ? p.onEditorStateChange
-                           : null;
-                if (onCh) {
-                  dbg('fiber: editorState prop="' + k + '" at depth=' + depth);
-                  draftProps = { editorState: p[k], onChange: onCh };
-                  break;
-                }
-              }
-            }
-          }
-
-          if (!draftProps) {
-            const inst = fiber.stateNode;
-            if (inst && typeof inst === 'object' && !(inst instanceof Element) &&
-                typeof inst.getEditorKey === 'function' &&
-                inst.props && isES(inst.props.editorState) &&
-                typeof inst.props.onChange === 'function') {
-              dbg('fiber: DraftEditor stateNode at depth=' + depth);
-              draftProps = { editorState: inst.props.editorState, onChange: inst.props.onChange };
-            }
-          }
-
-          if (!draftProps && depth % 50 === 0 && depth > 0) {
-            const p2 = fiber.memoizedProps;
-            dbg('fiber: depth=' + depth + ' hasOnChange=' + !!(p2 && typeof p2.onChange === 'function'));
-          }
-
-          if (!draftProps) { fiber = fiber.return; depth++; }
-        }
-
-        dbg('fiber: found=' + !!draftProps + ' depth=' + depth + ' fiberNull=' + !fiber);
-        if (!draftProps) return false;
-
-        const { editorState, onChange } = draftProps;
-        const getContent = () => editorState.getCurrentContent
-          ? editorState.getCurrentContent()
-          : editorState.get('currentContent');
-        const cs  = getContent();
-        const sel = editorState.getSelection ? editorState.getSelection() : editorState.get('selection');
-        const CS  = cs.constructor;
-        const ES  = editorState.constructor;
-        const plainText = typeof cs?.getPlainText === 'function' ? cs.getPlainText('\n') : null;
-        const sameText = plainText !== null &&
-          normalizeComparableText(plainText) === normalizeComparableText(editableEl.textContent || '');
-
-        dbg('fiber: CS.createFromText=' + typeof CS.createFromText + ' ES.createWithContent=' + typeof ES.createWithContent);
-
-        if (
-          !sameText ||
-          typeof sel?.merge !== 'function' ||
-          typeof CS.createFromText !== 'function' ||
-          typeof ES.createWithContent !== 'function' ||
-          typeof ES.forceSelection !== 'function'
-        ) {
-          return false;
-        }
-
-        const newContent = CS.createFromText(replacementText);
-        const lastBlk    = newContent.getLastBlock ? newContent.getLastBlock()
-                         : newContent.get('blockMap').last();
-        const blkKey = lastBlk.getKey ? lastBlk.getKey() : lastBlk.get('key');
-        const blkLen = lastBlk.getLength ? lastBlk.getLength() : lastBlk.get('text').length;
-        const newSel = sel.merge({
-          anchorKey: blkKey, anchorOffset: blkLen,
-          focusKey:  blkKey, focusOffset:  blkLen,
-          hasFocus: true, isBackward: false,
-        });
-        onChange(ES.forceSelection(ES.createWithContent(newContent), newSel));
-        snap('B_draft_content_replaced', editableEl);
-        this.scheduleApplyStep(applyToken, () => {
-          editableEl.focus();
-          if ((editableEl.textContent || '') !== originalEditableText) {
-            finalize();
-          } else if (typeof onNoChange === 'function') {
-            onNoChange();
-          } else {
-            this.showApplyError(USER_MESSAGES.editorReplacementUnconfirmed);
-          }
-        }, 80);
-        return true;
-      } catch (e) {
-        dbg('fiber error: ' + e.message + ' | ' + (e.stack || '').slice(0, 100));
-        return false;
-      }
     },
 
     planTextControlReplacement(value, start, end, originalText, replacementText) {
@@ -2306,6 +2436,11 @@
     finishApplySuccess(result) {
       const focusEl = result?.focusEl || null;
       if (result?.lastApply) this.lastApply = result.lastApply;
+      dbg('apply success', {
+        method: result?.method || null,
+        kind: result?.kind || null,
+        withUndo: result?.withUndo !== false,
+      });
       this.closeMenu();
       this.focusWithoutScroll(focusEl);
       this.showConfirmation(result?.withUndo !== false);
@@ -2335,10 +2470,17 @@
         refs.copyBtn.dataset.text = correctedText;
         refs.copyBtn.style.display = 'inline-block';
       }
-      const copied = await copyTextToClipboard(correctedText);
+      const copied = await copyTextToClipboard(correctedText, this.uiRoot);
       const fallbackMessage = copied
         ? USER_MESSAGES.replacementCopied
         : USER_MESSAGES.replacementCopyFailure;
+      dbgProblem('apply-failure', {
+        message: message || null,
+        copied,
+        sourceType: this.selectionSource?.type || null,
+        sourceKind: this.selectionSource?.kind || null,
+        correctedChars: (correctedText || '').length,
+      });
       this.showApplyError(fallbackMessage || message || USER_MESSAGES.applyGenericFailure);
     },
 
@@ -2379,230 +2521,210 @@
 
     // ─────────────────────────────────────────────
     // Remplacement du texte
-    // 3 stratégies selon le type d'élément cible
     // ─────────────────────────────────────────────
     applyCorrection(corrected) {
       if (!this.selectionSource) {
+        dbgProblem('apply-no-selection-source');
         void this.handleApplyFailure(USER_MESSAGES.selectionLost, corrected);
         return;
       }
 
       this.clearApplyError();
       const applyToken = this.beginApplyFlow();
+      dbg('applyCorrection start', {
+        applyToken,
+        sourceType: this.selectionSource.type,
+        sourceKind: this.selectionSource.kind || null,
+        correctedChars: (corrected || '').length,
+      });
 
       try {
         const result = this.applyCorrectionToSelection(corrected, this.selectionSource, applyToken);
         const replacementText = result.replacementText || this.getReplacementText(corrected);
         if (result.handled) {
           if (result.ok) this.finishApplySuccess(result);
-          else void this.handleApplyFailure(this.getApplyFailureMessage(result), corrected);
+          else {
+            dbgProblem('apply-handled-failure', {
+              reason: result.reason || null,
+              method: result.method || null,
+              kind: result.kind || null,
+            });
+            void this.handleApplyFailure(this.getApplyFailureMessage(result), corrected);
+          }
           return;
         }
 
         if (!this.selectedRange) {
+          dbgProblem('apply-missing-range');
           void this.handleApplyFailure(USER_MESSAGES.selectionLost, corrected);
           return;
         }
 
         const anchor = this.selectedRange.commonAncestorContainer;
         const parent = anchor.nodeType === Node.TEXT_NODE ? anchor.parentElement : anchor;
-        const sel    = window.getSelection();
-
-        // ── Cas 2 : contenteditable ─────────────────
         const editableEl = this.getEditableRootFromNode(parent);
-        if (editableEl) {
-          snap('A_avant_tout', editableEl);
-          if (!this.isRangeValid()) {
-            void this.handleApplyFailure(USER_MESSAGES.selectionChanged, corrected);
+        if (!editableEl) {
+          void this.handleApplyFailure(USER_MESSAGES.applyGenericFailure, corrected);
+          return;
+        }
+
+        snap('A_avant_tout', editableEl);
+        if (!this.isRangeValid()) {
+          void this.handleApplyFailure(USER_MESSAGES.selectionChanged, corrected);
+          return;
+        }
+        if (debugEnabled) {
+          watchMutations(editableEl, 8000);
+          watchKeys(editableEl, 8000);
+        }
+
+        const originalEditableText = editableEl.textContent || '';
+        const safeWholeReplace = this.selectionMatchesWholeEditable(editableEl);
+
+        const finalize = () => {
+          if (!this.isApplyFlowActive(applyToken)) return;
+          this.finishApplySuccess({
+            lastApply: { type: 'contenteditable' },
+            focusEl: editableEl,
+            withUndo: false,
+          });
+          snap('E_apres_closeMenu', editableEl);
+        };
+
+        const failEditableApply = () => {
+          if (!this.isApplyFlowActive(applyToken)) return;
+          void this.handleApplyFailure(
+            safeWholeReplace
+              ? USER_MESSAGES.editorWholeReplaceFailure
+              : USER_MESSAGES.editorPartialReplaceFailure,
+            corrected
+          );
+        };
+
+        const performEditableInsert = (prefix, onNoChange) => {
+          const finishAttempt = (label) => {
+            this.scheduleApplyStep(applyToken, () => {
+              snap(label, editableEl);
+              if ((editableEl.textContent || '') !== originalEditableText) {
+                finalize();
+              } else if (typeof onNoChange === 'function') {
+                onNoChange();
+              } else {
+                failEditableApply();
+              }
+            }, APPLY_CONFIRM_DELAY_MS);
+          };
+
+          snap(`${prefix}_avant_beforeinput`, editableEl);
+          let beforeInputHandled = false;
+          try {
+            const beforeEvt = new InputEvent('beforeinput', {
+              bubbles: true,
+              cancelable: true,
+              inputType: 'insertReplacementText',
+              data: replacementText,
+            });
+            beforeInputHandled = !editableEl.dispatchEvent(beforeEvt);
+            snap(`${prefix}_beforeinput_handled=${beforeInputHandled}`, editableEl);
+          } catch (err) {
+            dbg(`${prefix} beforeinput error: ${err.message}`);
+          }
+
+          // If the editor cancelled beforeinput, it may still apply asynchronously.
+          // Wait longer before deciding success/failure to avoid double-insert.
+          if (beforeInputHandled) {
+            finishAttempt(`${prefix}_apres_beforeinput`);
             return;
           }
-          if (debugEnabled) {
-            watchMutations(editableEl, 8000);
-            watchKeys(editableEl, 8000);
+
+          const insertViaExecCommand = (txt) => {
+            if (typeof document.execCommand !== 'function') return false;
+            try {
+              return document.execCommand('insertText', false, txt);
+            } catch (_) {
+              return false;
+            }
+          };
+
+          // Prefer execCommand to preserve rich markup when possible.
+          let execOk = insertViaExecCommand(replacementText);
+          if (!execOk) {
+            try {
+              const sel = window.getSelection();
+              if (sel && sel.rangeCount > 0) {
+                const range = sel.getRangeAt(0);
+                if (this.rangeBelongsToEditable(range, editableEl)) {
+                  range.deleteContents();
+                  const node = document.createTextNode(replacementText);
+                  range.insertNode(node);
+                  range.setStartAfter(node);
+                  range.setEndAfter(node);
+                  sel.removeAllRanges();
+                  sel.addRange(range);
+                  this.dispatchReplacementInput(editableEl, replacementText);
+                  execOk = true;
+                }
+              }
+            } catch (_) {
+              execOk = false;
+            }
+          }
+          snap(`${prefix}_exec_ok=${execOk}`, editableEl);
+          if (execOk) {
+            finishAttempt(`${prefix}_apres_exec`);
+            return;
           }
 
-          const originalEditableText = editableEl.textContent || '';
-          const safeWholeReplace = this.selectionMatchesWholeEditable(editableEl);
+          failEditableApply();
+        };
 
-          const finalize = () => {
-            if (!this.isApplyFlowActive(applyToken)) return;
-            this.finishApplySuccess({
-              lastApply: { type: 'contenteditable' },
-              focusEl: editableEl,
-              withUndo: false,
-            });
-            snap('E_apres_closeMenu', editableEl);
-          };
+        const selectAllInsideEditable = () => {
+          try {
+            const range = document.createRange();
+            range.selectNodeContents(editableEl);
+            const sel = window.getSelection();
+            if (!sel) return false;
+            sel.removeAllRanges();
+            sel.addRange(range);
+            return true;
+          } catch (_) {
+            return false;
+          }
+        };
 
-          const failEditableApply = () => {
-            if (!this.isApplyFlowActive(applyToken)) return;
-            void this.handleApplyFailure(
-              safeWholeReplace
-                ? USER_MESSAGES.editorWholeReplaceFailure
-                : USER_MESSAGES.editorPartialReplaceFailure,
-              corrected
-            );
-          };
-
-          const performEditableInsert = (prefix, onNoChange) => {
-            const finishAttempt = (label) => {
-              this.scheduleApplyStep(applyToken, () => {
-                snap(label, editableEl);
-                if ((editableEl.textContent || '') !== originalEditableText) {
-                  finalize();
-                } else if (typeof onNoChange === 'function') {
-                  onNoChange();
-                } else {
-                  failEditableApply();
-                }
-              }, 30);
-            };
-
-            snap(`${prefix}_avant_beforeinput`, editableEl);
-            let beforeInputHandled = false;
-            try {
-              const beforeEvt = new InputEvent('beforeinput', {
-                bubbles: true,
-                cancelable: true,
-                inputType: 'insertReplacementText',
-                data: replacementText,
-              });
-              beforeInputHandled = !editableEl.dispatchEvent(beforeEvt);
-              snap(`${prefix}_beforeinput_handled=${beforeInputHandled}`, editableEl);
-            } catch (err) {
-              dbg(`${prefix} beforeinput error: ${err.message}`);
-            }
-
-            if (beforeInputHandled) {
-              finishAttempt(`${prefix}_apres_beforeinput`);
-              return;
-            }
-
-            const insertViaRange = (txt) => {
-              try {
-                const sel = window.getSelection();
-                if (!sel || sel.rangeCount === 0) return false;
-                const range = sel.getRangeAt(0);
-                range.deleteContents();
-                const node = document.createTextNode(txt);
-                range.insertNode(node);
-                range.setStartAfter(node);
-                range.setEndAfter(node);
-                sel.removeAllRanges();
-                sel.addRange(range);
-                editableEl.dispatchEvent(new InputEvent('input', {
-                  bubbles: true,
-                  cancelable: false,
-                  inputType: 'insertReplacementText',
-                  data: txt,
-                }));
-                return true;
-              } catch (_) {
-                return false;
-              }
-            };
-
-            let execOk = insertViaRange(replacementText);
-            if (!execOk && typeof document.execCommand === 'function') {
-              try { execOk = document.execCommand('insertText', false, replacementText); } catch (_) {}
-            }
-            snap(`${prefix}_exec_ok=${execOk}`, editableEl);
-            if (execOk) {
-              finishAttempt(`${prefix}_apres_exec`);
-              return;
-            }
-
-            try {
-              const dt = new DataTransfer();
-              dt.setData('text/plain', replacementText);
-              const pasteEvt = new ClipboardEvent('paste', {
-                bubbles: true,
-                cancelable: true,
-                clipboardData: dt,
-              });
-              const pasteHandled = !editableEl.dispatchEvent(pasteEvt);
-              snap(`${prefix}_paste_handled=${pasteHandled}`, editableEl);
-            } catch (err) {
-              dbg(`${prefix} paste error: ${err.message}`);
-            }
-
-            finishAttempt(`${prefix}_apres_fallbacks`);
-          };
-
-          const runWholeEditorFallback = () => {
-            if (!safeWholeReplace) {
+        const runWholeEditorFallback = () => {
+          if (!safeWholeReplace) {
+            failEditableApply();
+            return;
+          }
+          editableEl.focus();
+          snap('C_focus_full', editableEl);
+          this.scheduleApplyStep(applyToken, () => {
+            if (!selectAllInsideEditable()) {
               failEditableApply();
               return;
             }
-            editableEl.focus();
-            snap('C_focus_full', editableEl);
-            this.scheduleApplyStep(applyToken, () => {
-              document.execCommand('selectAll');
-              snap('C_selectAll_full', editableEl);
-              this.scheduleApplyStep(applyToken, () => performEditableInsert('C_full'), 25);
-            }, 30);
-          };
+            snap('C_selectAll_full', editableEl);
+            this.scheduleApplyStep(applyToken, () => performEditableInsert('C_full'), APPLY_CONFIRM_DELAY_MS);
+          }, APPLY_CONFIRM_DELAY_MS);
+        };
 
-          // ── Stratégie A : fiber React → remplacement direct du ContentState ──
-          if (
-            safeWholeReplace &&
-            this.tryDraftReactWholeEditorReplacement(
-              editableEl,
-              replacementText,
-              originalEditableText,
-              applyToken,
-              finalize,
-              runWholeEditorFallback
-            )
-          ) {
+        editableEl.focus();
+        snap('B_focus_done', editableEl);
+        this.scheduleApplyStep(applyToken, () => {
+          const restored = this.restoreSavedRangeSelection(this.selectionSource);
+          snap('B2_restore_selection=' + restored, editableEl);
+          if (!restored) {
+            runWholeEditorFallback();
             return;
           }
-
-          // ── Stratégie B : restaurer la vraie sélection puis beforeinput ────────
-          editableEl.focus();
-          snap('B_focus_done', editableEl);
           this.scheduleApplyStep(applyToken, () => {
-            const restored = this.restoreSavedRangeSelection(this.selectionSource);
-            snap('B2_restore_selection=' + restored, editableEl);
-            if (!restored) {
-              runWholeEditorFallback();
-              return;
-            }
-            this.scheduleApplyStep(applyToken, () => {
-              performEditableInsert('B_selection', safeWholeReplace ? runWholeEditorFallback : null);
-            }, 25);
-          }, 30);
-          return;
-        }
-
-        // ── Cas 3 : DOM statique (span, p, div…) ───
-        if (!this.isRangeValid()) {
-          this.showApplyError(USER_MESSAGES.selectionChanged);
-          return;
-        }
-        const originalText = this.selectedRange.toString();
-        this.selectedRange.deleteContents();
-        const textNode = document.createTextNode(replacementText);
-        this.selectedRange.insertNode(textNode);
-        if (!textNode.isConnected || textNode.nodeValue !== replacementText) {
-          this.showApplyError(USER_MESSAGES.staticReplacementUnconfirmed);
-          return;
-        }
-
-        const newRange = document.createRange();
-        newRange.setStartAfter(textNode);
-        newRange.collapse(true);
-        if (sel) { sel.removeAllRanges(); sel.addRange(newRange); }
-
-        this.lastApply = {
-          type: 'dom', textNode, originalText,
-          parentNode: textNode.parentNode, nextSibling: textNode.nextSibling,
-        };
-        this.closeMenu();
-        this.showConfirmation(true);
-
+            performEditableInsert('B_selection', safeWholeReplace ? runWholeEditorFallback : null);
+          }, APPLY_CONFIRM_DELAY_MS);
+        }, APPLY_CONFIRM_DELAY_MS);
       } catch (err) {
         console.error('[Correcteur]', err);
+        dbgProblem('apply-exception', { message: err?.message || String(err), stack: (err?.stack || '').slice(0, 300) });
         void this.handleApplyFailure(USER_MESSAGES.applyGenericFailure, corrected);
       }
     },
@@ -2641,11 +2763,13 @@
       if (!errEl) {
         errEl = document.createElement('div');
         errEl.className = 'corrector-apply-error';
+        errEl.setAttribute('role', 'alert');
         const actions = refs.actions;
         actions.parentNode.insertBefore(errEl, actions);
         refs.applyError = errEl;
       }
       errEl.textContent = '\u26A0\uFE0F ' + msg;
+      dbgProblem('apply-error-ui', { message: msg });
       if (refs.copyBtn?.dataset.text) refs.copyBtn.style.display = 'inline-block';
     },
 
@@ -2653,11 +2777,21 @@
       if (!confirmationEnabled) return;
       const toast = document.createElement('div');
       toast.className = 'corrector-toast';
+      toast.lang = 'fr';
       toast.setAttribute('role', 'status');
 
       const msgSpan = document.createElement('span');
       msgSpan.textContent = '\u2713 Correction appliquée';
       toast.appendChild(msgSpan);
+
+      let fadeTimer = null;
+      const scheduleFade = (delay) => {
+        clearTimeout(fadeTimer);
+        fadeTimer = setTimeout(() => {
+          toast.classList.add('corrector-toast-fade');
+          setTimeout(() => toast.remove(), 400);
+        }, delay);
+      };
 
       if (withUndo) {
         const undoBtn = document.createElement('button');
@@ -2665,25 +2799,21 @@
         undoBtn.type        = 'button';
         undoBtn.setAttribute('aria-label', 'Annuler le remplacement');
         undoBtn.textContent = 'Annuler';
-        undoBtn.addEventListener('click', () => { this.undoLastApply(); toast.remove(); });
+        undoBtn.addEventListener('click', () => {
+          clearTimeout(fadeTimer);
+          this.undoLastApply();
+          toast.remove();
+        });
         toast.appendChild(undoBtn);
       }
 
       this.ensureUiRoot().appendChild(toast);
+      scheduleFade(withUndo ? 8000 : 4000);
 
-      let fadeTimer = setTimeout(() => {
-        toast.classList.add('corrector-toast-fade');
-        setTimeout(() => toast.remove(), 400);
-      }, 3000);
-
-      // Pause le fade si la souris survole (pour laisser le temps de cliquer "Annuler")
       toast.addEventListener('mouseenter', () => clearTimeout(fadeTimer));
-      toast.addEventListener('mouseleave', () => {
-        fadeTimer = setTimeout(() => {
-          toast.classList.add('corrector-toast-fade');
-          setTimeout(() => toast.remove(), 400);
-        }, 1200);
-      });
+      toast.addEventListener('mouseleave', () => scheduleFade(2000));
+      toast.addEventListener('focusin', () => clearTimeout(fadeTimer));
+      toast.addEventListener('focusout', () => scheduleFade(2000));
     },
 
     // ─────────────────────────────────────────────
@@ -2691,7 +2821,9 @@
     // ─────────────────────────────────────────────
     handleOutsideClick(e) {
       if (this.isUiEvent(e)) return;
-      if (this.menu) this.closeMenu();
+      if (!this.menu) return;
+      if (Date.now() - (this._menuOpenedAt || 0) < MENU_OPEN_CLICK_GUARD_MS) return;
+      this.closeMenu();
     },
 
     handleKeyDown(e) {
@@ -2903,11 +3035,34 @@
           cursor: default;
           opacity: .55;
         }
+        .corrector-position-actions {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+        .corrector-position-btn {
+          cursor: pointer;
+          min-height: 32px;
+          padding: 6px 10px;
+          border: 1px solid #fdba74;
+          background: #fff;
+          color: #7c2d12;
+          border-radius: 6px;
+          font-size: 11px;
+          font-weight: 600;
+        }
+        .corrector-position-btn:hover {
+          background: #fff7ed;
+        }
+        .corrector-position-btn:focus-visible {
+          outline: 2px solid #2563eb;
+          outline-offset: 2px;
+        }
 
         .corrector-section { padding: 10px 14px 0; }
         .corrector-label {
           font-size: 10px; font-weight: 700; text-transform: uppercase;
-          letter-spacing: .06em; color: #9ca3af; margin-bottom: 5px;
+          letter-spacing: .06em; color: #4b5563; margin-bottom: 5px;
         }
 
         /* Zones texte */
@@ -3208,8 +3363,8 @@
         }
         .corrector-settings-btn,
         .corrector-close-btn {
-          width: 30px;
-          height: 30px;
+          width: 36px;
+          height: 36px;
           display: inline-grid;
           place-items: center;
           border: 1px solid transparent;
