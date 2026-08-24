@@ -72,6 +72,15 @@ const createCorrectionHarness = () => {
   const SENTENCE_END_REGEX = /[.!?…]\s*$/;
   const TITLE_CASE_REGEX = /^\p{Lu}[\p{Ll}]+$/u;
   const NON_LETTER_REGEX = /[^\p{L}]/gu;
+  const FR_ACCENT_REGEX = /[àâäéèêëïîôöùûüçœæ]/i;
+  const FR_ELISION_REGEX = /\b(?:[jltdnmsç]|qu)['’]/gi;
+  const FR_SIGNAL_WORDS_REGEX = /\b(?:je|tu|nous|vous|ils|elles|avec|dans|pour|mais|donc|parce|que|qui|une|des|les|aux|sur|pas|plus|très|jpp|mdr|ptdr|tkt|jsp|pcq|bcp)\b/gi;
+  const EN_SIGNAL_WORDS_REGEX = /\b(?:the|and|you|that|with|this|have|from|they|what|when|your|are|is|was|were)\b/gi;
+  const DE_SIGNAL_WORDS_REGEX = /\b(?:der|die|das|und|ich|nicht|sie|mit|auf|für|den|dem|ein|eine)\b/gi;
+  const PT_SIGNAL_WORDS_REGEX = /\b(?:não|você|com|para|uma|os|as|que|por|mais|muito|está)\b/gi;
+  const SLANG_TOKEN_REGEX = /\b(?:jpp|mdr|ptdr|tkt|jsp|pk|pcq|bcp|tt|wsh|fdp|lol|ok|ahah+|haha+|hehe+|xd)\b/gi;
+  const LAUGH_TOKEN_REGEX = /\b(?:a+h+a+h*|h+a+h+a*|h+e+h+e*)\b/gi;
+  const LT_CANDIDATE_LIMIT = 8;
   const DANGEROUS_UNICODE_REGEX = /[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/;
   const ZALGO_COMBINER_REGEX = /[\u0300-\u036f]{4,}/;
   const cloneRegex = (regex) => new RegExp(regex.source, regex.flags);
@@ -106,6 +115,15 @@ const createCorrectionHarness = () => {
     SENTENCE_END_REGEX,
     TITLE_CASE_REGEX,
     NON_LETTER_REGEX,
+    FR_ACCENT_REGEX,
+    FR_ELISION_REGEX,
+    FR_SIGNAL_WORDS_REGEX,
+    EN_SIGNAL_WORDS_REGEX,
+    DE_SIGNAL_WORDS_REGEX,
+    PT_SIGNAL_WORDS_REGEX,
+    SLANG_TOKEN_REGEX,
+    LAUGH_TOKEN_REGEX,
+    LT_CANDIDATE_LIMIT,
     countPatternMatches,
     cloneRegex,
     isSafeReplacement,
@@ -128,7 +146,9 @@ const createCorrectionHarness = () => {
     lowerCaseFirstLetter: ['text'],
     normalizeReplacementCasing: ['matchInfo', 'replacement', 'text'],
     isReplacementSafe: ['matchInfo', 'replacement', 'replacementWordCount', 'context'],
-    scoreReplacementCandidate: ['matchInfo', 'replacement', 'replacementWordCount', 'context'],
+    estimateEditDistance: ['a', 'b'],
+    scoreReplacementCandidate: ['matchInfo', 'replacement', 'replacementWordCount', 'context', 'rank = 0'],
+    pickReplacementCandidates: ['matchInfo', 'text', 'context'],
     pickReplacement: ['matchInfo', 'text', 'context'],
     scorePreparedMatch: ['matchInfo', 'replacementValue', 'context'],
     shouldKeepMatchInfo: ['matchInfo', 'context'],
@@ -136,6 +156,12 @@ const createCorrectionHarness = () => {
     shouldKeepMatch: ['matchInfo', 'replacementValue', 'context'],
     prepareMatches: ['text', 'matches', 'correctionContext'],
     applyMatches: ['text', 'matches'],
+    normalizeAnalysisText: ['text'],
+    polishFrenchSegment: ['segment'],
+    postProcessFrench: ['corrected', 'context', 'originalText = \'\'', 'preparedMatches = []'],
+    shiftProtectedRanges: ['ranges', 'start', 'end'],
+    polishFrenchOutsideProtected: ['text', 'protectedRanges'],
+    detectContentLanguageSignals: ['text'],
   };
   for (const [name, args] of Object.entries(methodArgs)) {
     harness[name] = buildMethod(name, args, env);
@@ -165,8 +191,8 @@ const makeContext = (overrides = {}) => ({
 });
 
 test('userscript metadata targets the public LanguageTool API', () => {
-  assert.equal(pkg.version, '4.12.0');
-  assert.match(userscript, /@version\s+4\.12\.0/);
+  assert.equal(pkg.version, '4.13.0');
+  assert.match(userscript, /@version\s+4\.13\.0/);
   const updateLine = userscript.split(/\r?\n/).find((line) => line.includes('@updateURL'));
   assert.equal(
     updateLine,
@@ -178,7 +204,7 @@ test('userscript metadata targets the public LanguageTool API', () => {
   assert.match(userscript, /@grant\s+GM_setClipboard/);
   assert.doesNotMatch(userscript, /@grant\s+GM_deleteValue/);
   assert.match(userscript, /LANGUAGETOOL_ENDPOINT = 'https:\/\/api\.languagetool\.org\/v2\/check'/);
-  assert.match(userscript, /SCRIPT_USER_AGENT = 'CorrecteurDePhrases\/4\.12\.0/);
+  assert.match(userscript, /SCRIPT_USER_AGENT = 'CorrecteurDePhrases\/4\.13\.0/);
   assert.doesNotMatch(userscript, /languagetoolplus\.com/);
   assert.doesNotMatch(userscript, /tryDraftReactWholeEditorReplacement/);
 });
@@ -194,12 +220,17 @@ test('LanguageTool requests keep strict mode and rate-limit guards explicit', ()
   assert.match(userscript, /getCooldownError\(\)/);
   assert.match(userscript, /startLanguageToolCooldown\(\)/);
   assert.match(userscript, /res\.status === 429/);
+  assert.match(userscript, /language === 'auto'/);
+  assert.match(userscript, /getSafeRetryContext\(/);
+  assert.match(userscript, /parseLanguageToolErrorBody\(/);
 });
 
 test('LanguageTool payload uses language hints and server-side category filters by mode', () => {
   const buildLanguageToolPayload = buildMethod('buildLanguageToolPayload', ['text', 'context'], {
     URLSearchParams,
     LANGUAGETOOL_PREFERRED_VARIANTS: 'fr-FR,en-US,de-DE,pt-PT',
+    CHAT_DISABLED_RULES: 'FRENCH_WHITESPACE,FR_SPACE_BEFORE_PUNCTUATION,MULTIPLE_SPACES,WHITESPACE_RULE',
+    motherTongue: 'fr',
   });
 
   const chatParams = new URLSearchParams(buildLanguageToolPayload.call(
@@ -210,6 +241,8 @@ test('LanguageTool payload uses language hints and server-side category filters 
   assert.equal(chatParams.get('language'), 'fr');
   assert.equal(chatParams.get('level'), 'default');
   assert.equal(chatParams.get('disabledCategories'), 'STYLE,REDUNDANCY,COLLOQUIALISMS,TYPOGRAPHY');
+  assert.equal(chatParams.get('disabledRules'), 'FRENCH_WHITESPACE,FR_SPACE_BEFORE_PUNCTUATION,MULTIPLE_SPACES,WHITESPACE_RULE');
+  assert.equal(chatParams.has('preferredVariants'), false);
 
   const balancedParams = new URLSearchParams(buildLanguageToolPayload.call(
     {},
@@ -217,15 +250,18 @@ test('LanguageTool payload uses language hints and server-side category filters 
     { mode: 'balanced', language: 'auto' }
   ));
   assert.equal(balancedParams.get('language'), 'auto');
+  assert.equal(balancedParams.get('preferredVariants'), 'fr-FR,en-US,de-DE,pt-PT');
   assert.equal(balancedParams.get('disabledCategories'), 'STYLE,REDUNDANCY');
 
   const strictParams = new URLSearchParams(buildLanguageToolPayload.call(
     {},
     'Hello',
-    { mode: 'strict', language: 'en-US' }
+    { mode: 'strict', language: 'en-US', motherTongue: 'fr' }
   ));
   assert.equal(strictParams.get('level'), 'picky');
   assert.equal(strictParams.has('disabledCategories'), false);
+  assert.equal(strictParams.has('preferredVariants'), false);
+  assert.equal(strictParams.get('motherTongue'), 'fr');
 });
 
 test('detectLanguageHint prefers field lang and defaults to auto', () => {
@@ -257,6 +293,46 @@ test('detectLanguageHint prefers field lang and defaults to auto', () => {
   assert.equal(fallbackAuto, null);
 });
 
+test('resolveCorrectionLanguage uses field lang, FR/chat signals, then auto', () => {
+  const corrector = createCorrectionHarness();
+  const mapLanguageCode = buildMethod('mapLanguageCode', ['rawLang']);
+  class FakeHTMLElement {}
+  const detectLanguageHint = buildMethod('detectLanguageHint', ['selectionContext'], {
+    Node: { TEXT_NODE: 3 },
+    HTMLElement: FakeHTMLElement,
+  });
+  const resolveCorrectionLanguage = buildMethod('resolveCorrectionLanguage', ['text', 'selectionContext = null', 'profile = null'], {
+    correctionMode: 'balanced',
+  });
+
+  const frField = Object.create(FakeHTMLElement.prototype);
+  frField.getAttribute = () => 'fr';
+  frField.closest = () => frField;
+
+  const api = {
+    mapLanguageCode,
+    detectLanguageHint,
+    detectContentLanguageSignals: corrector.detectContentLanguageSignals,
+  };
+
+  assert.equal(
+    resolveCorrectionLanguage.call(api, 'Hello there', { type: 'control', el: frField }, { chatLike: false }),
+    'fr'
+  );
+  assert.equal(
+    resolveCorrectionLanguage.call(api, 'Je suis aller au magasin', null, { chatLike: false }),
+    'fr'
+  );
+  assert.equal(
+    resolveCorrectionLanguage.call(api, 'AHAHHA jpp', null, { chatLike: true }),
+    'fr'
+  );
+  assert.equal(
+    resolveCorrectionLanguage.call(api, 'xyz', null, { chatLike: true }),
+    'auto'
+  );
+});
+
 test('persistent cache uses compact hashed keys and a seven-day TTL', () => {
   assert.match(userscript, /PERSIST_CACHE_KEY = '__corrector_v4_cache'/);
   assert.match(userscript, /CORRECTION_CACHE_MAX = 200/);
@@ -264,7 +340,7 @@ test('persistent cache uses compact hashed keys and a seven-day TTL', () => {
   assert.match(userscript, /correctionCache: persistCacheLoad\(\)/);
   assert.match(userscript, /GM_setValue\(PERSIST_CACHE_KEY, JSON\.stringify\(arr\)\)/);
   assert.match(userscript, /persistCacheSave\.flush\?\.\(\)/);
-  assert.match(userscript, /return \[context\.host, context\.mode, context\.language \|\| 'auto', flavor, \(text \|\| ''\)\.length, hashFNV1a\(text\)\]\.join\('\|\|'\)/);
+  assert.match(userscript, /context\.motherTongue \|\| 'none'/);
 });
 
 test('hashFNV1a is deterministic and compact', () => {
@@ -394,7 +470,86 @@ test('cache keys are stable and do not expose the selected text', () => {
   assert.equal(firstKey, secondKey);
   assert.notEqual(firstKey, changedKey);
   assert.equal(firstKey.includes(text), false);
-  assert.match(firstKey, /^mail\.example\.com\|\|strict\|\|fr\|\|prose\|\|\d+\|\|[0-9a-z]+$/);
+  assert.match(firstKey, /^mail\.example\.com\|\|strict\|\|fr\|\|none\|\|prose\|\|\d+\|\|[0-9a-z]+$/);
+});
+
+test('French slang tokens are protected from replacements', () => {
+  const corrector = createCorrectionHarness();
+  const text = 'AHAHHA jpp mdr tkt';
+  const analysis = corrector.analyzeSelectionText(text, 'discord.com');
+  const protectedKinds = new Set(analysis.protectedRanges.map((range) => range.kind));
+  assert.ok(protectedKinds.has('slang') || protectedKinds.has('laugh'));
+  assert.equal(analysis.profile.chatLike, true);
+
+  const context = makeContext({
+    mode: 'chat-lite',
+    profile: analysis.profile,
+    protectedRanges: analysis.protectedRanges,
+  });
+  const jppOffset = text.indexOf('jpp');
+  const matchInfo = corrector.createMatchInfo({
+    offset: jppOffset,
+    length: 3,
+    replacements: [{ value: 'je peux plus' }],
+    rule: { issueType: 'misspelling', category: { id: 'TYPOS' }, id: 'FAKE_SLANG' },
+  }, text);
+  assert.equal(corrector.shouldKeepMatchInfo(matchInfo, context), false);
+});
+
+test('scoring prefers short first LT suggestion over long chat rewrite', () => {
+  const corrector = createCorrectionHarness();
+  const text = 'salut';
+  const matchInfo = corrector.createMatchInfo({
+    offset: 0,
+    length: 5,
+    replacements: [
+      { value: 'Salut' },
+      { value: 'Bonjour à toutes et à tous mes amis' },
+    ],
+    rule: { issueType: 'misspelling', category: { id: 'TYPOS' }, id: 'FAKE' },
+  }, text);
+  const context = makeContext({
+    mode: 'chat-lite',
+    profile: { chatLike: true, wordCount: 1, letterCount: 5, urlCount: 0, mentionCount: 0, hashtagCount: 0, emojiCount: 0, symbolRatio: 0, codeish: false },
+  });
+  const ranked = corrector.pickReplacementCandidates(matchInfo, text, context);
+  assert.ok(ranked.length >= 1);
+  assert.equal(ranked[0].value, 'Salut');
+});
+
+test('prepared matches expose alternatives for cycling', () => {
+  const corrector = createCorrectionHarness();
+  const text = 'Je suis aller';
+  const matches = [{
+    offset: 8,
+    length: 5,
+    message: 'Accord',
+    replacements: [{ value: 'allé' }, { value: 'allée' }, { value: 'allas' }],
+    rule: { issueType: 'grammar', category: { id: 'GRAMMAR' }, id: 'FAKE_GRAMMAR' },
+  }];
+  const prepared = corrector.prepareMatches(text, matches, makeContext({ mode: 'balanced' }));
+  assert.equal(prepared.length, 1);
+  assert.equal(prepared[0].replacementValue, 'allé');
+  assert.ok(prepared[0].replacementAlternatives.length >= 2);
+  prepared[0].alternativeIndex = 1;
+  prepared[0].replacementValue = prepared[0].replacementAlternatives[1];
+  assert.equal(corrector.applyMatches(text, prepared), 'Je suis allée');
+});
+
+test('French post-process adds spaces before punctuation outside chat mode', () => {
+  const corrector = createCorrectionHarness();
+  const balanced = corrector.postProcessFrench('Vraiment?', makeContext({ mode: 'balanced', language: 'fr' }), 'Vraiment?', []);
+  assert.equal(balanced, 'Vraiment ?');
+  const chat = corrector.postProcessFrench('Vraiment?', makeContext({ mode: 'chat-lite', language: 'fr' }), 'Vraiment?', []);
+  assert.equal(chat, 'Vraiment?');
+});
+
+test('HTTP 400 retry uses a safe payload without preferredVariants on fixed language', () => {
+  assert.match(userscript, /getSafeRetryContext\(/);
+  assert.match(userscript, /res\.status === 400 && !retried/);
+  const getSafeRetryContext = buildMethod('getSafeRetryContext', ['context']);
+  assert.deepEqual(getSafeRetryContext({ language: 'fr', mode: 'balanced' }), { language: 'auto', mode: 'balanced' });
+  assert.deepEqual(getSafeRetryContext({ language: 'auto', mode: 'chat-lite' }), { language: 'fr', mode: 'chat-lite' });
 });
 
 test('UI hardening helpers cover copy, contenteditable, abort, and menu position', () => {
@@ -945,7 +1100,7 @@ test('UI states and diff highlights are explicit', () => {
 test('prepareMatches filters noisy match info before scoring replacements', () => {
   const prepareBody = getBlockBody('prepareMatches');
   const infoCheckIndex = prepareBody.indexOf('this.shouldKeepMatchInfo(matchInfo, correctionContext)');
-  const pickIndex = prepareBody.indexOf('this.pickReplacement(matchInfo, text, correctionContext)');
+  const pickIndex = prepareBody.indexOf('this.pickReplacementCandidates(matchInfo, text, correctionContext)');
   const finalCheckIndex = prepareBody.indexOf('this.shouldKeepMatchFinal(matchInfo, replacementValue, correctionContext)');
   assert.ok(infoCheckIndex > -1);
   assert.ok(pickIndex > -1);
@@ -953,6 +1108,8 @@ test('prepareMatches filters noisy match info before scoring replacements', () =
   assert.ok(infoCheckIndex < pickIndex);
   assert.ok(pickIndex < finalCheckIndex);
   assert.match(userscript, /shouldKeepMatch\(matchInfo, replacementValue, context\) \{\s*return this\.shouldKeepMatchInfo/);
+  assert.match(userscript, /cycleMatchAlternative\(/);
+  assert.match(userscript, /corrector-fix-cycle/);
 });
 
 test('applyMatches applies sorted replacements in one pass and skips overlaps', () => {

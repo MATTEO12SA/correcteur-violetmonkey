@@ -58,17 +58,21 @@ Pour forcer une mise à jour manuelle :
 
 ## Fonctionnalités
 
-- Détection de langue via `language=auto` (LanguageTool), avec variantes préférées
-- Utilise le `lang` du champ ou de l'ancêtre le plus proche quand il est fiable, sinon `auto`
+- Détection de langue intelligente : `lang` du champ, signaux FR/chat dans le texte, sinon `language=auto`
+- `preferredVariants` envoyé **uniquement** si `language=auto` (évite les erreurs HTTP 400 LanguageTool)
 - Diff visuel : erreurs soulignées en rouge, corrections surlignées en vert
+- Clic sur une correction verte pour cycler les alternatives LanguageTool
 - Modes de correction `Chat`, `Équilibré` et `Strict` via l'engrenage
 - Mode `Strict` avec niveau LanguageTool `picky`, modes `Chat` et `Équilibré` en niveau standard
 - Filtrage serveur des catégories trop agressives en modes `Chat` et `Équilibré`
 - Filtrage intelligent des suggestions trop agressives sur les messages courts et le chat
-- Protection des `@mentions`, `#hashtags`, URLs, emails et blocs inline sensibles
+- Protection des `@mentions`, `#hashtags`, URLs, emails, blocs inline et argot FR courant (`jpp`, `mdr`, `tkt`…)
+- Post-traitement français local (espaces avant `? ! : ;`) hors mode Chat
+- Langue maternelle configurable (faux amis LanguageTool), défaut français
 - Exclusion des champs sensibles (`password`, paiement, `autocomplete` carte / téléphone / email)
 - Cache persistant des corrections récentes (sans extraits de texte LanguageTool)
 - Gestion claire des limites API (requêtes et volume), timeouts et erreurs réseau
+- Retry automatique sur HTTP 400 avec un payload sûr et message d'erreur réel
 - Panneau déplaçable, position mémorisée entre les sessions
 - Compatible avec les SPA (Facebook, Instagram, Twitter…)
 - Interface isolée en Shadow DOM pour éviter les conflits CSS avec les sites visités
@@ -87,7 +91,7 @@ Le script utilise l'endpoint public documenté de LanguageTool :
 https://api.languagetool.org/v2/check
 ```
 
-Quand vous cliquez **Corriger**, le texte sélectionné est envoyé à LanguageTool pour analyse. Le script envoie un `User-Agent` applicatif, utilise `language=auto` (ou le `lang` local fiable du champ), et ajoute `preferredVariants=fr-FR,en-US,de-DE,pt-PT`.
+Quand vous cliquez **Corriger**, le texte sélectionné est envoyé à LanguageTool pour analyse. Le script envoie un `User-Agent` applicatif, choisit la langue (`lang` du champ, signaux de contenu, ou `auto`), et n'ajoute `preferredVariants=fr-FR,en-US,de-DE,pt-PT` **que** lorsque `language=auto`.
 
 Limites importantes du service gratuit :
 
@@ -97,11 +101,11 @@ Limites importantes du service gratuit :
 
 Le script bloque donc les sélections trop longues et respecte un quota local de requêtes et d'octets avant l'appel API. Il affiche un message clair en cas de limite, timeout ou erreur réseau.
 
-Les réglages (mode, debug, confirmation, position) sont stockés via `GM_setValue` / `GM_getValue` (stockage Violentmonkey), pas dans le `localStorage` de la page.
+Les réglages (mode, langue maternelle, debug, confirmation, position) sont stockés via `GM_setValue` / `GM_getValue` (stockage Violentmonkey), pas dans le `localStorage` de la page.
 
 ## Cache persistant
 
-Les corrections LanguageTool sont conservées localement pendant 7 jours via le stockage Violentmonkey (`GM_setValue` / `GM_getValue`). La clé de cache utilise le site, le mode de correction, la langue, le profil du texte, sa longueur et un hash FNV-1a du contenu, ce qui évite de stocker le texte complet dans les clés.
+Les corrections LanguageTool sont conservées localement pendant 7 jours via le stockage Violentmonkey (`GM_setValue` / `GM_getValue`). La clé de cache utilise le site, le mode de correction, la langue, la langue maternelle, le profil du texte, sa longueur et un hash FNV-1a du contenu, ce qui évite de stocker le texte complet dans les clés.
 
 Les valeurs de cache ne conservent que les champs utiles (`offset`, `length`, `replacements`, `message`, `rule`) : les extraits `context.text` de LanguageTool ne sont pas persistés.
 
@@ -111,7 +115,7 @@ Le cache est limité à 200 entrées récentes. Il sert uniquement à réaffiche
 
 Le mode debug est désactivé par défaut.
 
-- Le même engrenage permet aussi de choisir le niveau de correction (`Chat`, `Équilibré`, `Strict`)
+- Le même engrenage permet aussi de choisir le niveau de correction (`Chat`, `Équilibré`, `Strict`) et la langue maternelle (faux amis)
 - Méthode recommandée : ouvrez le panneau du correcteur puis cliquez sur l'engrenage pour activer les logs
 - Les logs se téléchargent manuellement via le bouton `Télécharger les logs` dans ce même panneau
 - Activer temporairement sur une page : ajoutez `?correctorDebug=1` à l'URL
